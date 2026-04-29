@@ -1,4 +1,43 @@
-.git
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Compiled objects and binaries
 *.o
+*.obj
 *.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Debug and profiler output
+*.pdb
+*.ilk
+*.dSYM/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Editor and local tooling
+.vs/
+.idea/
+.vscode/ipch/
+.vscode/.browse.VC.db*
+.vscode/*.log
+
+# Local files
 *.layout
+*.user
+*.log

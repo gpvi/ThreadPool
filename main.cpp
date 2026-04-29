@@ -3,16 +3,12 @@
 #include<random>
 using namespace std;
 
-random_device rd;
-mt19937 mt(rd());
-uniform_int_distribution<int> dist(-1000, 1000); // 均匀分布的整数
-
-auto rnd = bind(dist,mt);
-
 // 设置线程睡眠时间
 void simulate_hard_computation()
 {
-	this_thread::sleep_for(chrono::milliseconds(2000 + rnd()));
+	thread_local mt19937 mt(random_device{}());
+	uniform_int_distribution<int> dist(-1000, 1000); // 均匀分布的整数
+	this_thread::sleep_for(chrono::milliseconds(2000 + dist(mt)));
 }
 // 添加两个数字的简单函数并打印结果
 void multiply(const int a, const int b)
@@ -41,7 +37,6 @@ int multiply_return(const int a, const int b)
 
 void example(){
 	ThreadPool pool(3);
-	pool.init();
 	for(int i=0;i<=2;i++){
 		//TODO
 		for(int j=0;j<=9;j++){
