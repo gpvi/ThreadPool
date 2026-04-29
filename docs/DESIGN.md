@@ -9,11 +9,12 @@
 核心目标：
 
 - 使用固定数量 worker 线程复用系统线程资源。
+- 支持纯线程模式和线程 + 协程模式切换。
 - 支持普通函数、lambda、成员函数和带返回值任务。
 - 使用 `std::future` 把异步任务结果返回给调用方。
 - 支持优雅关闭和取消尚未执行的排队任务。
 - 支持等待线程池空闲，方便测试和业务同步。
-- 支持 C++20 协程调度到线程池执行。
+- 支持 C++20 协程调度到线程池执行，并支持协程主动让出 worker。
 - 提供压力测试和基础 benchmark，观察稳定性、吞吐和调度延迟。
 - 保持 C++14 基础接口可用，同时在 C++20 下启用协程能力。
 
@@ -30,10 +31,11 @@ flowchart TD
     Schedule --> ResumeTask["coroutine resume task"]
 
     Package --> Future["std::future"]
-    Package --> Queue["SafeQueue<std::function<void()>>"]
-    ResumeTask --> Queue
+    Package --> Queue["全局普通任务队列"]
+    ResumeTask --> LocalQueue["worker 本地协程队列"]
 
     Queue --> Cond["condition_variable"]
+    LocalQueue --> Cond
     Cond --> WorkerA["Worker 0"]
     Cond --> WorkerB["Worker 1"]
     Cond --> WorkerC["Worker N"]
@@ -50,10 +52,15 @@ flowchart TD
 主要组件：
 
 - `threadpool::ThreadPool`：线程池主体，负责 worker 创建、任务提交、关闭、状态查询。
+- `ExecutionMode`：运行模式，决定线程池是否启用协程调度能力。
+- `Options`：线程池启动参数，包含 worker 数量和运行模式。
 - `threadpool::SafeQueue<T>`：线程安全队列，保存待执行任务。
+- 全局任务队列：保存普通 `submit()` 任务。
+- worker 本地协程队列：保存对应 worker 的协程恢复任务。
 - `Worker`：内部工作线程对象，循环等待、取任务、执行任务。
 - `StopSource` / `StopToken`：协作式取消机制。
-- `ScheduleAwaiter`：C++20 协程调度器入口。
+- `ScheduleAwaiter`：把协程切换到线程池 worker。
+- `YieldAwaiter`：让当前协程主动让出 worker，并重新排队等待恢复。
 
 ## 任务模型
 
@@ -105,7 +112,41 @@ sequenceDiagram
 
 ## 调度策略
 
-当前线程池使用的是固定线程数、共享 FIFO 队列、条件变量唤醒的调度策略。
+当前线程池使用的是固定线程数、普通任务全局 FIFO 队列、worker 本地协程队列、条件变量唤醒的调度策略。
+
+### 运行模式
+
+线程池支持两种运行模式：
+
+```cpp
+enum class ExecutionMode {
+	ThreadOnly,
+	ThreadAndCoroutine
+};
+```
+
+默认模式是 `ThreadOnly`，只启用普通任务提交和 worker 调度。该模式适合大多数同步函数、lambda、成员函数等普通任务。
+
+如果需要使用 C++20 协程调度，需要显式启用 `ThreadAndCoroutine`：
+
+```cpp
+threadpool::ThreadPool pool(
+	4,
+	threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine
+);
+```
+
+也可以使用启动参数对象：
+
+```cpp
+threadpool::ThreadPool::Options options;
+options.worker_count = 4;
+options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine;
+
+threadpool::ThreadPool pool(options);
+```
+
+这样做的原因是让普通线程池场景保持简单，协程能力作为显式增强项启用，避免调用方误以为所有线程池实例都可以进行协程调度。
 
 ### 固定线程数
 
@@ -126,11 +167,33 @@ worker 数量不能为 0，否则构造函数抛出 `std::invalid_argument`。
 
 ### 共享 FIFO 队列
 
-所有任务进入同一个 `SafeQueue<std::function<void()>>`。
+普通任务进入全局 `SafeQueue<std::function<void()>>`。
 
 worker 被唤醒后从队列头部取任务执行，因此整体上接近 FIFO。
 
 注意：由于多线程并发执行，任务“开始执行”的顺序接近提交顺序，但任务“完成”的顺序不保证一致。耗时短的任务可能比先提交的长任务更早完成。
+
+### worker 本地协程队列
+
+在线程 + 协程模式下，每个 worker 维护一个本地协程队列：
+
+```text
+Worker 0 coroutine queue
+Worker 1 coroutine queue
+Worker N coroutine queue
+```
+
+普通任务仍然进入全局队列，协程恢复任务进入 worker 本地队列。
+
+调度策略：
+
+- `schedule()`：按轮询策略选择一个 worker，并把协程恢复动作放入该 worker 的本地协程队列。
+- `yield()`：如果当前协程已经运行在线程池 worker 上，则优先放回当前 worker 的本地协程队列。
+- worker 执行任务时，优先检查自己的协程队列，再检查全局普通任务队列。
+- worker 连续执行一定数量的协程恢复任务后，会优先检查一次全局普通任务队列，避免普通任务饥饿。
+- worker 本地协程队列为空且全局普通任务队列也为空时，会尝试从其他 worker 的协程队列偷取恢复任务。
+
+这个设计让“每个 worker 承载多个协程”的模型更清晰，也为后续实现 worker 本地调度、亲和性和 work stealing 留出空间。
 
 ### 条件变量唤醒
 
@@ -242,9 +305,10 @@ pool.shutdown(threadpool::ThreadPool::ShutdownMode::CancelPending);
 语义：
 
 - 停止接收新任务。
-- 清空还没开始执行的排队任务。
+- 清空还没开始执行的普通排队任务。
 - 已经开始执行的任务继续运行到结束。
 - 被清空任务对应的 `future.get()` 会抛 `std::future_error`。
+- 已经挂起并进入 worker 协程队列的协程恢复任务不会被直接清空，避免协程永远无法恢复并导致等待方挂起。
 
 适合程序退出、用户取消批量作业、服务降级等场景。
 
@@ -319,9 +383,10 @@ co_await pool.schedule();
 
 1. 当前协程挂起。
 2. `ScheduleAwaiter::await_suspend()` 得到 `std::coroutine_handle<>`。
-3. 把 `handle.resume()` 封装成普通线程池任务。
-4. worker 执行该任务。
-5. 协程从 `co_await` 后的位置继续运行。
+3. 按轮询策略选择一个 worker。
+4. 把 `handle.resume()` 封装成恢复任务，放入目标 worker 的本地协程队列。
+5. worker 执行该恢复任务。
+6. 协程从 `co_await` 后的位置继续运行。
 
 ```mermaid
 sequenceDiagram
@@ -331,7 +396,7 @@ sequenceDiagram
     participant W as Worker
 
     Co->>Aw: co_await pool.schedule()
-    Aw->>P: submit(handle.resume)
+    Aw->>P: enqueue handle.resume to worker coroutine queue
     Co-->>Aw: suspend
     W->>P: pop resume task
     W->>Co: handle.resume()
@@ -339,7 +404,28 @@ sequenceDiagram
 
 这个设计不是重新实现协程，而是利用标准协程机制，补上“在哪里恢复执行”的调度策略。
 
-当前协程支持仍然是轻量级的，只支持调度恢复，不提供完整 `Task<T>` 异步组合模型。
+在协程已经运行到线程池 worker 后，还可以使用：
+
+```cpp
+co_await pool.yield();
+```
+
+`yield()` 会把当前协程挂起，并把 `resume()` 重新放回当前 worker 的本地协程队列。这样同一个 worker 线程可以在多个协程之间协作式轮转：
+
+```text
+Worker 0
+  -> resume coroutine A
+  -> A yield，重新入队
+  -> resume coroutine B
+  -> B yield，重新入队
+  -> resume coroutine A
+```
+
+这种模型仍然是协作式调度，不是抢占式调度。如果某个协程长时间不 `yield`，它仍然会占用当前 worker。
+
+当前协程支持仍然是轻量级的，只提供调度恢复和协作式让出，不提供完整 `Task<T>` 异步组合模型。
+
+如果线程池处于 `ThreadOnly` 模式，调用 `schedule()` 或 `yield()` 会抛出 `std::runtime_error`。这能尽早暴露模式配置错误。
 
 ## 线程安全设计
 
@@ -355,6 +441,7 @@ sequenceDiagram
 
 - `SafeQueue` 内部使用自己的 mutex 保护队列。
 - `ThreadPool` 使用 `m_conditional_mutex` 保护关闭状态、启动状态和 active task 计数。
+- 每个 worker 的协程队列独立加锁，普通任务队列和协程队列分离。
 - worker 等待使用 `condition_variable` predicate。
 - 任务提交时在锁内检查 `m_shutdown`，避免关闭后继续入队。
 
@@ -437,7 +524,7 @@ worker 数量构造后固定。
 
 ### 6. 协程支持还很轻量
 
-当前只有 `schedule()`，没有：
+当前只有 `schedule()` 和 `yield()`，没有：
 
 - `Task<T>`
 - 协程返回值组合
@@ -466,6 +553,33 @@ worker 数量构造后固定。
 - `p50_us` / `p95_us` / `p99_us`：任务从提交到开始执行的延迟采样。
 
 benchmark 没有加入默认 CTest。功能正确性由单元测试、协程测试和压力测试覆盖；benchmark 主要用于人工观察不同配置下的性能趋势。
+
+## 纯线程模式与线程 + 协程模式对比
+
+项目提供 `mode_compare.cpp`，用于对比两种模式：
+
+- `ThreadOnly`：提交普通任务，由 worker 直接取出并执行。
+- `ThreadAndCoroutine`：启动多个协程，协程切换到 worker 后多次 `yield`，观察协作式轮转成本。
+
+运行方式：
+
+```powershell
+.\threadpool_mode_compare.exe <tasks> <coroutines> <yields_per_coroutine> <workers>
+```
+
+示例：
+
+```powershell
+.\threadpool_mode_compare.exe 20000 2000 10 4
+```
+
+对比指标：
+
+- `operations`：完成的普通任务数，或协程中的 yield 步骤加最终完成步骤。
+- `ms`：总耗时。
+- `ops/sec`：每秒完成操作数。
+
+需要注意的是，两种模式衡量的不是完全相同的工作负载。纯线程模式偏向“任务吞吐”；线程 + 协程模式偏向“协程挂起、重新排队、恢复执行”的调度开销观察。协程模式的优势通常体现在复杂异步流程、等待型任务和大量轻量执行单元，而不是极短 CPU 空任务。
 
 ## 适合场景
 

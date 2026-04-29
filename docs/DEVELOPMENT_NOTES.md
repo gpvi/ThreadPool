@@ -197,7 +197,146 @@ C++20 协程只提供挂起和恢复机制，不提供事件循环、线程池�
 
 该方案是轻量调度入口，不是完整 `Task<T>` 协程框架。
 
-## 11. `std::result_of` 在 MSVC/C++20 下不可用
+## 11. 单个 worker 上如何承载多个协程
+
+### 问题
+
+如果协程切换到线程池后一直执行，也会像普通任务一样占用 worker。这样并不能体现“一个线程承载多个协程”的优势。
+
+### 原因
+
+C++ 协程不是抢占式调度。协程只有遇到 `co_await` 并主动挂起时，调度器才有机会恢复其他协程。
+
+### 解决策略
+
+增加 `yield()` awaiter：
+
+```cpp
+co_await pool.yield();
+```
+
+语义：
+
+1. 当前协程主动挂起。
+2. 将当前协程的恢复动作重新提交到线程池队列。
+3. 当前 worker 可以继续执行队列中的其他任务或协程。
+4. 之后某个 worker 再恢复该协程。
+
+这使线程池具备基础的协作式协程轮转能力，但仍不是完整协程运行时。
+
+## 12. 协程恢复任务不应全部混在全局队列里
+
+### 问题
+
+最初 `schedule()` 和 `yield()` 都是把协程恢复动作封装成普通任务，直接提交到全局任务队列。这样虽然实现简单，但不符合“每个 worker 维护自己的协程队列”的模型。
+
+### 原因
+
+普通任务和协程恢复任务混在一个队列中，会导致：
+
+- 无法表达协程与 worker 的亲和性。
+- `yield()` 后不一定回到当前 worker。
+- 后续很难扩展本地调度或 work stealing。
+
+### 解决策略
+
+为每个 worker 增加本地协程队列：
+
+```text
+Worker 0 -> coroutine queue 0
+Worker 1 -> coroutine queue 1
+```
+
+调度策略：
+
+- 普通任务仍进入全局任务队列。
+- `schedule()` 轮询选择 worker，并把协程恢复动作放入该 worker 的本地协程队列。
+- `yield()` 优先把当前协程放回当前 worker 的本地协程队列。
+- worker 优先执行自己的协程队列，再执行全局普通任务队列。
+
+这样可以更清楚地表达“一个 worker 承载多个协程”的运行模型。
+
+## 13. 快速关闭时不能直接丢弃已挂起协程
+
+### 问题
+
+`CancelPending` 如果直接清空 worker 本地协程队列，已经挂起的协程可能永远不会恢复，对应的等待方可能一直阻塞。
+
+### 原因
+
+协程挂起后，恢复动作保存在队列中的 `resume()` 任务里。直接丢弃该任务会让协程没有机会继续执行、传播异常或完成 promise。
+
+### 解决策略
+
+`CancelPending` 只清空普通任务队列，不直接清空 worker 本地协程队列。已经挂起的协程会被恢复一次，后续如果继续调度，由于线程池已经关闭，会通过异常路径结束。
+
+## 14. 本地协程队列可能导致普通任务饥饿
+
+### 问题
+
+如果 worker 永远优先执行本地协程队列，而协程又频繁 `yield()` 重新入队，普通任务可能长时间得不到执行。
+
+### 原因
+
+本地协程队列优先级过高，缺少公平性控制。
+
+### 解决策略
+
+增加连续协程执行配额。worker 连续执行一定数量的协程恢复任务后，会优先检查一次全局普通任务队列。如果普通任务存在，就先执行普通任务，并重置配额。
+
+## 15. 本地协程队列可能造成 worker 负载不均
+
+### 问题
+
+某些 worker 的协程队列可能很满，而其他 worker 空闲。
+
+### 原因
+
+`schedule()` 只负责初始分配，`yield()` 会优先回到当前 worker，本地队列天然可能产生负载偏斜。
+
+### 解决策略
+
+增加基础 work stealing：当 worker 自己的协程队列为空、全局普通任务队列也为空时，会尝试从其他 worker 的协程队列偷取恢复任务执行。
+
+## 16. 协程能力需要显式启用
+
+### 问题
+
+线程池同时支持普通任务和协程调度。如果所有实例默认都开放协程接口，调用方容易忽略运行模式差异，也不利于表达“纯线程池”和“线程 + 协程调度器”两种不同用途。
+
+### 原因
+
+普通线程池只需要执行 `submit()` 提交的任务；协程模式还需要处理 `schedule()` 和 `yield()` 这类协程恢复动作。两者可以共用底层 worker 和任务队列，但语义不同。
+
+### 解决策略
+
+增加运行模式：
+
+- `ThreadOnly`：默认模式，只运行普通任务。
+- `ThreadAndCoroutine`：启用协程调度和协作式让出。
+
+构造时显式选择：
+
+```cpp
+threadpool::ThreadPool pool(
+	4,
+	threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine
+);
+```
+
+也可以使用 `Options` 统一传递启动参数：
+
+```cpp
+threadpool::ThreadPool::Options options;
+options.worker_count = 4;
+options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine;
+
+threadpool::ThreadPool pool(options);
+```
+
+如果在纯线程模式下调用协程调度接口，直接抛出异常，尽早暴露配置错误。
+
+## 17. `std::result_of` 在 MSVC/C++20 下不可用
 
 ### 问题
 
@@ -216,7 +355,7 @@ GitHub Actions Windows 构建协程测试时失败，错误提示 `result_of` �
 
 这样既能保持 C++14 基础接口，又能让 C++20 协程目标通过 MSVC 编译。
 
-## 12. `std::chrono::duration::rep` 在不同平台类型不同
+## 18. `std::chrono::duration::rep` 在不同平台类型不同
 
 ### 问题
 
@@ -236,7 +375,7 @@ Microseconds::rep
 
 这样 benchmark 在不同平台上都能匹配对应的 future 类型。
 
-## 13. benchmark 不应作为默认功能测试
+## 19. benchmark 不应作为默认功能测试
 
 ### 问题
 
@@ -259,7 +398,7 @@ CMake 构建 benchmark 目标，但不把 benchmark 加入默认 CTest。默认 
 
 benchmark 保留为人工运行工具。
 
-## 14. 极短任务下 worker 越多不一定越快
+## 20. 极短任务下 worker 越多不一定越快
 
 ### 问题
 
@@ -288,7 +427,7 @@ benchmark 中发现，极短任务场景下，增加 worker 数量不一定提�
 - work stealing。
 - 减少任务封装开销。
 
-## 15. CMake 与手动编译需要同时维护
+## 21. CMake 与手动编译需要同时维护
 
 ### 问题
 
@@ -302,7 +441,7 @@ benchmark 中发现，极短任务场景下，增加 worker 数量不一定提�
 
 README 中优先推荐 CMake，手动 g++ 命令作为补充。新增 `stress_test.cpp`、`benchmark.cpp`、`test_coroutine.cpp` 后同步更新 CMake 和 README。
 
-## 16. 构建产物容易误加入 Git
+## 22. 构建产物容易误加入 Git
 
 ### 问题
 
@@ -323,7 +462,7 @@ README 中优先推荐 CMake，手动 g++ 命令作为补充。新增 `stress_te
 - IDE 缓存。
 - 日志和用户本地配置。
 
-## 17. GitHub Actions 需要覆盖不同平台
+## 23. GitHub Actions 需要覆盖不同平台
 
 ### 问题
 
@@ -354,7 +493,7 @@ ctest
 - MSVC/C++20 下 `std::result_of` 不可用。
 - MSVC 下不支持 GCC 专属头文件 `bits/stdc++.h`。
 
-## 18. `bits/stdc++.h` 不具备跨平台可移植性
+## 24. `bits/stdc++.h` 不具备跨平台可移植性
 
 ### 问题
 
@@ -378,7 +517,7 @@ Windows GitHub Actions 使用 MSVC 构建 demo 时失败，提示找不到 `bits
 
 生产代码和示例代码都应优先使用标准头文件，避免只在单一编译器环境下可用。
 
-## 19. 文档需要分层
+## 25. 文档需要分层
 
 ### 问题
 
@@ -398,7 +537,7 @@ README 内容不断追加后变得像教程笔记，项目首页信息过重。
 
 这样读者可以根据目的选择阅读路径。
 
-## 20. 简历表达需要突出难点而不是堆接口名
+## 26. 简历表达需要突出难点而不是堆接口名
 
 ### 问题
 

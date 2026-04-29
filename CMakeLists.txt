@@ -25,6 +25,10 @@ target_link_libraries(threadpool_stress PRIVATE threadpool)
 add_executable(threadpool_benchmark benchmark.cpp)
 target_link_libraries(threadpool_benchmark PRIVATE threadpool)
 
+add_executable(threadpool_mode_compare mode_compare.cpp)
+target_compile_features(threadpool_mode_compare PRIVATE cxx_std_20)
+target_link_libraries(threadpool_mode_compare PRIVATE threadpool)
+
 enable_testing()
 add_test(NAME threadpool_tests COMMAND threadpool_tests)
 add_test(NAME threadpool_coroutine_tests COMMAND threadpool_coroutine_tests)
