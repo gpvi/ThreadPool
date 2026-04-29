@@ -22,6 +22,9 @@ target_link_libraries(threadpool_coroutine_tests PRIVATE threadpool)
 add_executable(threadpool_stress stress_test.cpp)
 target_link_libraries(threadpool_stress PRIVATE threadpool)
 
+add_executable(threadpool_benchmark benchmark.cpp)
+target_link_libraries(threadpool_benchmark PRIVATE threadpool)
+
 enable_testing()
 add_test(NAME threadpool_tests COMMAND threadpool_tests)
 add_test(NAME threadpool_coroutine_tests COMMAND threadpool_coroutine_tests)

@@ -14,6 +14,7 @@
 - 支持优雅关闭和取消尚未执行的排队任务。
 - 支持等待线程池空闲，方便测试和业务同步。
 - 支持 C++20 协程调度到线程池执行。
+- 提供压力测试和基础 benchmark，观察稳定性、吞吐和调度延迟。
 - 保持 C++14 基础接口可用，同时在 C++20 下启用协程能力。
 
 ## 总体架构
@@ -398,6 +399,7 @@ auto future = pool.submit(task, args...);
 - 行为测试。
 - 协程测试。
 - 压力测试。
+- 基准测试。
 
 比单纯 demo 更接近可维护组件。
 
@@ -443,14 +445,27 @@ worker 数量构造后固定。
 - cancellation-aware awaiter
 - structured concurrency
 
-### 7. 没有系统级 benchmark
+### 7. benchmark 仍然比较基础
 
-目前有压力测试，但还没有严格 benchmark，例如：
+目前提供了一个基础 benchmark，用于观察不同 worker 数下的任务吞吐和简单延迟采样。但它还不是严格性能评测体系，例如尚未覆盖：
 
-- 不同任务粒度下吞吐量。
-- 不同 worker 数下延迟。
 - 和 `std::async` 或其他线程池对比。
 - 长时间 soak test。
+- CPU 亲和性、系统负载隔离和统计置信区间。
+- 不同任务粒度、不同队列策略下的系统化对比。
+
+运行方式：
+
+```powershell
+.\threadpool_benchmark.exe <tasks> <submitters>
+```
+
+输出指标：
+
+- `tasks/sec`：单位时间完成的任务数。
+- `p50_us` / `p95_us` / `p99_us`：任务从提交到开始执行的延迟采样。
+
+benchmark 没有加入默认 CTest。功能正确性由单元测试、协程测试和压力测试覆盖；benchmark 主要用于人工观察不同配置下的性能趋势。
 
 ## 适合场景
 

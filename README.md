@@ -1,64 +1,38 @@
 # ThreadPool
 
-一个用于学习 C++ 并发编程的线程池示例项目。项目从最小线程池出发，展示任务队列、worker 线程、`std::future` 结果返回，以及 C++20 协程如何调度到线程池执行。
+一个 C++ 轻量级线程池项目，用于演示固定线程池、任务调度、异步结果返回、协作式取消、C++20 协程调度，以及基础压力测试和 benchmark。
 
-更完整的设计说明见：[docs/DESIGN.md](docs/DESIGN.md)。
+项目定位偏学习与工程实践：代码规模较小，但覆盖了线程池从“能运行”到“可测试、可观测、可扩展”的关键设计点。详细设计说明见 [docs/DESIGN.md](docs/DESIGN.md)。
 
-## 项目意义
+## 核心能力
 
-这个项目不是为了替代成熟的生产级并发库，而是用较小的代码量串起 C++ 并发里的核心概念：
-
-- `SafeQueue`：线程安全任务队列
-- `ThreadPool`：管理 worker 线程和任务调度
-- `std::condition_variable`：让空闲 worker 休眠，并在新任务到来时唤醒
-- `std::packaged_task`：封装任务并保存返回值或异常
-- `std::future`：让调用方等待并获取异步任务结果
-- C++20 coroutine：用 `co_await pool.schedule()` 把协程恢复到线程池 worker 上
-- `wait_idle()`：等待队列任务和正在执行的任务全部完成
-- `ShutdownMode`：支持优雅排空和取消排队任务两种关闭策略
-- `StopSource` / `StopToken`：支持任务内部协作式取消
+- 固定数量 worker 线程，复用线程资源，减少频繁创建线程的开销。
+- 基于线程安全 FIFO 队列和条件变量完成任务调度、阻塞等待和唤醒。
+- 支持普通函数、lambda、成员函数等任务形式。
+- 使用 `std::packaged_task` 和 `std::future` 支持异步返回值和异常传播。
+- 支持自动启动、析构自动关闭、优雅排空和取消排队任务。
+- 支持等待线程池空闲、查询排队任务数和活跃任务数。
+- 支持 `StopSource` / `StopToken` 协作式取消。
+- 在 C++20 下支持 `co_await pool.schedule()`，让协程恢复到线程池 worker 执行。
+- 提供单元测试、协程测试、压力测试和 benchmark。
 
 ## 项目结构
 
 ```text
 .
 ├── CMakeLists.txt        # CMake 构建入口
-├── SafeQueue.h           # 线程安全队列
-├── ThreadPool.h          # 线程池实现
-├── main.cpp              # 示例程序
-├── test.cpp              # C++14 基础行为测试
+├── SafeQueue.h           # 线程安全任务队列
+├── ThreadPool.h          # 线程池主体实现
+├── main.cpp              # 基础示例
+├── test.cpp              # C++14 行为测试
 ├── test_coroutine.cpp    # C++20 协程调度测试
-└── stress_test.cpp       # 压力测试
+├── stress_test.cpp       # 压力测试
+├── benchmark.cpp         # 基准测试
+└── docs/
+    └── DESIGN.md         # 详细设计说明
 ```
 
-## 架构
-
-```mermaid
-flowchart TD
-    Main["调用方 / main.cpp"] --> Submit["ThreadPool::submit(f, args...)"]
-    Main --> Schedule["co_await ThreadPool::schedule()"]
-
-    Submit --> Bind["std::bind<br/>绑定函数和参数"]
-    Bind --> Task["std::packaged_task<br/>保存结果/异常"]
-    Task --> Future["std::future<br/>返回给调用方"]
-    Task --> Wrapper["std::function<void()>"]
-
-    Schedule --> Awaiter["ScheduleAwaiter"]
-    Awaiter --> ResumeTask["resume coroutine task"]
-    ResumeTask --> Queue["SafeQueue<std::function<void()>>"]
-    Wrapper --> Queue
-
-    Queue --> CV["condition_variable"]
-    CV --> Worker1["Worker Thread"]
-    CV --> Worker2["Worker Thread"]
-    CV --> Worker3["Worker Thread"]
-
-    Worker1 --> Execute["执行任务"]
-    Worker2 --> Execute
-    Worker3 --> Execute
-```
-
-## 如何构建和测试
+## 快速开始
 
 推荐使用 CMake：
 
@@ -68,55 +42,43 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-也可以直接用 g++ 编译：
+CTest 默认运行：
 
-```powershell
-g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread main.cpp -o threadpool_check.exe
-g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread test.cpp -o threadpool_tests.exe
-g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test_coroutine.cpp -o threadpool_coroutine_tests.exe
-g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread stress_test.cpp -o threadpool_stress.exe
-```
+- `threadpool_tests`
+- `threadpool_coroutine_tests`
+- `threadpool_stress`
 
-运行：
-
-```powershell
-.\threadpool_check.exe
-.\threadpool_tests.exe
-.\threadpool_coroutine_tests.exe
-.\threadpool_stress.exe
-```
-
-压力测试支持传参：
-
-```powershell
-.\threadpool_stress.exe <tasks> <workers> <submitters>
-```
-
-例如：
-
-```powershell
-.\threadpool_stress.exe 50000 8 8
-```
+benchmark 不加入默认 CTest，因为性能结果容易受机器配置、系统负载和编译器影响。
 
 ## 基本用法
 
-创建线程池后可以直接提交任务，构造函数会自动启动 worker 线程：
-
 ```cpp
-threadpool::ThreadPool pool(3);
+#include "ThreadPool.h"
 
-auto result = pool.submit([] {
-	return 42;
-});
+#include <iostream>
 
-std::cout << result.get() << std::endl;
+int main()
+{
+	threadpool::ThreadPool pool(4);
+
+	auto result = pool.submit([] {
+		return 42;
+	});
+
+	std::cout << result.get() << std::endl;
+	return 0;
+}
 ```
 
-`submit()` 返回 `std::future<T>`。如果任务还没完成，`future.get()` 会等待；如果任务抛出异常，异常会在 `future.get()` 时重新抛出。
+`submit()` 返回 `std::future<T>`：
 
-## 如何传递任务
+- 任务完成后，`future.get()` 返回结果。
+- 任务抛异常时，异常会在 `future.get()` 中重新抛出。
+- 任务没有返回值时，返回 `std::future<void>`。
 
-传普通函数：
+## 任务提交
+
+普通函数：
 
 ```cpp
 int add(int a, int b)
@@ -124,12 +86,10 @@ int add(int a, int b)
 	return a + b;
 }
 
-threadpool::ThreadPool pool(3);
 auto result = pool.submit(add, 1, 2);
-std::cout << result.get() << std::endl;
 ```
 
-传 lambda：
+lambda：
 
 ```cpp
 auto result = pool.submit([](int a, int b) {
@@ -137,20 +97,20 @@ auto result = pool.submit([](int a, int b) {
 }, 5, 6);
 ```
 
-传引用参数时需要使用 `std::ref`：
+引用参数需要使用 `std::ref`：
 
 ```cpp
-void multiply_output(int &out, int a, int b)
+void write_result(int &out)
 {
-	out = a * b;
+	out = 100;
 }
 
-int output = 0;
-auto done = pool.submit(multiply_output, std::ref(output), 5, 6);
+int value = 0;
+auto done = pool.submit(write_result, std::ref(value));
 done.get();
 ```
 
-传成员函数：
+成员函数：
 
 ```cpp
 class Calculator {
@@ -162,118 +122,50 @@ public:
 };
 
 Calculator calc;
-auto result = pool.submit(&Calculator::multiply, &calc, 4, 5);
+auto result = pool.submit(&Calculator::multiply, &calc, 3, 4);
 ```
 
-## submit 的实现思路
+## 关闭策略
 
-`submit()` 的核心目标是把任意形式的任务：
-
-```text
-function + args -> return value
-```
-
-统一转换成队列可以保存的：
-
-```text
-std::function<void()>
-```
-
-内部步骤：
-
-1. 使用 `std::result_of` 推导返回类型。
-2. 使用 `std::bind` 把函数和参数绑定成无参调用。
-3. 使用 `std::packaged_task` 包装任务，让结果可以通过 `future` 获取。
-4. 把 `packaged_task` 包成 `std::function<void()>`。
-5. 加锁检查线程池是否关闭，并把任务推入 `SafeQueue`。
-6. 调用 `notify_one()` 唤醒一个 worker。
-
-可以简单理解为：
-
-```text
-bind            负责绑定参数
-packaged_task   负责执行并保存结果
-future          负责把结果交还给调用方
-SafeQueue       负责在线程之间传递任务
-```
-
-## 协程支持
-
-C++20 的协程只提供语言机制，例如 `co_await`、`std::coroutine_handle`、挂起和恢复。标准库本身不提供线程池、事件循环或任务调度器。
-
-本项目提供了一个最小调度入口：
+默认关闭策略会等待已提交任务执行完成：
 
 ```cpp
-co_await pool.schedule();
+pool.shutdown();
 ```
 
-它的含义是：
-
-1. 当前协程挂起。
-2. 把协程的 `resume()` 封装成任务提交到线程池。
-3. worker 线程执行该任务。
-4. 协程在线程池 worker 上继续运行。
-
-示例：
+如果希望丢弃尚未开始执行的排队任务：
 
 ```cpp
-CoroutineTask work(ThreadPool &pool)
-{
-	co_await pool.schedule();
-
-	// 从这里开始运行在线程池 worker 线程中
-	do_heavy_work();
-}
+pool.shutdown(threadpool::ThreadPool::ShutdownMode::CancelPending);
 ```
 
-这里不是重新实现协程，而是使用 C++20 自带协程机制，并给它补上“在哪里恢复执行”的调度策略。
+两种模式的区别：
 
-## 关闭语义
+- `Drain`：停止接收新任务，但执行完已提交任务。
+- `CancelPending`：停止接收新任务，并丢弃尚未被 worker 取走的排队任务；这些任务对应的 `future.get()` 会抛出 `std::future_error`。
 
-默认的 `shutdown()` 使用 `ShutdownMode::Drain`，会：
+析构函数会自动调用关闭流程，避免忘记释放 worker 线程。
 
-1. 停止接收新任务。
-2. 唤醒所有等待中的 worker。
-3. 执行完队列中已经提交的任务。
-4. `join` 所有 worker 线程。
-
-如果希望尽快关闭，可以使用：
+## 状态观测
 
 ```cpp
-pool.shutdown(ThreadPool::ShutdownMode::CancelPending);
+pool.wait_idle();
+pool.wait_idle_for(std::chrono::seconds(1));
+pool.wait_idle_until(deadline);
+
+pool.worker_count();
+pool.queued_tasks();
+pool.active_tasks();
+pool.is_shutdown();
 ```
 
-这个模式会丢弃还没有被 worker 取走的排队任务，已经开始执行的任务仍会执行完成。被丢弃任务对应的 `future.get()` 会抛出 `std::future_error`，因为其 `packaged_task` 没有机会执行。
-
-如果在线程池关闭后继续调用 `submit()`，会抛出 `std::runtime_error`。
-
-析构函数会自动调用 `shutdown()`，因此忘记手动关闭时也能安全回收线程。
-
-## 运行时状态
-
-线程池提供了几个查询和同步接口，方便测试或上层业务做可观测性控制：
-
-```cpp
-pool.wait_idle();       // 等待队列为空且没有正在执行的任务
-pool.wait_idle_for(std::chrono::seconds(1)); // 在超时时间内等待空闲
-pool.worker_count();    // worker 线程数量
-pool.queued_tasks();    // 当前排队任务数量
-pool.active_tasks();    // 当前正在执行的任务数量
-pool.is_shutdown();     // 是否已经进入关闭状态
-```
-
-构造线程池时 worker 数量不能为 0：
-
-```cpp
-ThreadPool pool(0); // 抛出 std::invalid_argument
-```
+这些接口主要用于测试、批处理阶段同步和退出前收尾。
 
 ## 协作式取消
 
-线程池无法安全地强行杀死正在运行的 C++ 线程。更生产化的做法是协作式取消：任务定期检查 `StopToken`，发现请求后自己尽快返回。
+线程池不能安全地强制终止正在运行的 C++ 线程。项目使用协作式取消：由任务主动检查取消信号并安全退出。
 
 ```cpp
-threadpool::ThreadPool pool(2);
 threadpool::ThreadPool::StopSource stop_source;
 
 auto result = pool.submit_with_stop(
@@ -287,28 +179,115 @@ auto result = pool.submit_with_stop(
 );
 
 stop_source.request_stop();
-std::cout << result.get() << std::endl;
 ```
 
-这和 `ShutdownMode::CancelPending` 是两件事：
+`CancelPending` 负责取消还没开始执行的任务；`StopToken` 负责通知已经开始执行的任务自行退出。
 
-- `CancelPending` 只会丢弃还没开始执行的排队任务。
-- `StopToken` 用于通知已经开始执行的任务自行退出。
+## 协程调度
 
-## 适合的使用场景
+在支持 C++20 coroutine 的编译器下，可以使用：
 
-- 学习 C++ 线程池、条件变量、future 和协程调度
-- 把 CPU 密集型任务分发到多个 worker 线程
-- 批量处理文件、图片、日志或计算任务
-- 在小型工具中把耗时任务放到后台线程
-- 演示 C++20 协程如何切换到线程池执行
+```cpp
+co_await pool.schedule();
+```
+
+含义是：当前协程挂起，并把协程恢复动作提交到线程池；worker 线程执行恢复动作后，协程从 `co_await` 后继续运行。
+
+```cpp
+CoroutineTask work(threadpool::ThreadPool &pool)
+{
+	co_await pool.schedule();
+
+	// 从这里开始运行在线程池 worker 线程中
+	do_heavy_work();
+}
+```
+
+当前协程支持是轻量调度入口，不是完整的 `Task<T>` 协程框架。
+
+## 压力测试
+
+CMake 会构建压力测试目标，也会通过 CTest 运行一组轻量压力测试。
+
+手动运行：
+
+```powershell
+.\threadpool_stress.exe <tasks> <workers> <submitters>
+```
+
+示例：
+
+```powershell
+.\threadpool_stress.exe 50000 8 8
+```
+
+覆盖场景：
+
+- 大量任务提交和结果校验。
+- 多提交线程并发提交。
+- 排队任务取消。
+- 协作式取消。
+
+## Benchmark
+
+benchmark 用于观察不同 worker 数下的吞吐和简单调度延迟，不作为功能正确性测试。
+
+运行：
+
+```powershell
+.\threadpool_benchmark.exe <tasks> <submitters>
+```
+
+示例：
+
+```powershell
+.\threadpool_benchmark.exe 100000 4
+```
+
+输出指标：
+
+- `tasks/sec`：每秒完成任务数。
+- `p50_us` / `p95_us` / `p99_us`：任务从提交到开始执行的延迟采样。
+
+对极短任务来说，worker 数量增加不一定提升吞吐，因为共享队列锁和线程调度开销可能超过并行收益。
+
+## 手动编译
+
+不使用 CMake 时，也可以直接用 g++：
+
+```powershell
+g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread main.cpp -o threadpool_check.exe
+g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread test.cpp -o threadpool_tests.exe
+g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test_coroutine.cpp -o threadpool_coroutine_tests.exe
+g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread stress_test.cpp -o threadpool_stress.exe
+g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread benchmark.cpp -o threadpool_benchmark.exe
+```
+
+## 适用场景
+
+适合：
+
+- 学习 C++ 线程池、条件变量、future 和 coroutine 调度。
+- 小型工具中的后台任务执行。
+- CPU 密集型批处理。
+- 需要异步返回值的简单并行任务。
+- 验证线程池调度、取消、关闭和压力测试策略。
+
+不适合：
+
+- 高实时性任务调度。
+- 复杂优先级调度。
+- 极高吞吐、低延迟服务的核心路径。
+- 需要强制终止任务的场景。
+- 完整异步 runtime 或事件循环替代品。
 
 ## 当前边界
 
-这个项目仍然是学习型实现，还没有包含生产级线程池常见能力：
+项目仍保留一些明确边界：
 
-- 任务优先级
-- 单个任务级别的超时取消
-- 动态扩缩容
-- 完整的 `Task<T>` 协程返回值模型
-- 系统化性能基准和跨平台 CI
+- 没有任务优先级。
+- 没有动态扩缩容。
+- 没有 work stealing。
+- 没有单个任务级超时取消。
+- 协程支持还不是完整 `Task<T>` 模型。
+- benchmark 仍是基础版本，缺少跨平台 CI、长期 soak test 和统计置信区间。
