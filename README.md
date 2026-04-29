@@ -1,8 +1,6 @@
 # ThreadPool
 
-一个 C++ 轻量级线程池项目，用于演示固定线程池、任务调度、异步结果返回、协作式取消、C++20 协程调度，以及基础压力测试和 benchmark。
-
-项目定位偏学习与工程实践：代码规模较小，但覆盖了线程池从“能运行”到“可测试、可观测、可扩展”的关键设计点。
+一个 C++ 轻量级线程池项目，实现线程池、任务调度、异步结果返回、协作式取消、C++20 协程调度，以及基础压力测试和 benchmark。
 
 相关文档：
 
@@ -29,7 +27,18 @@
 .
 ├── CMakeLists.txt        # CMake 构建入口
 ├── SafeQueue.h           # 线程安全任务队列
-├── ThreadPool.h          # 线程池主体实现
+├── TaskScheduler.h       # 普通任务、协程队列、work stealing、空闲等待
+├── ThreadPool.h          # 对外主入口和线程池 facade
+├── ThreadPoolRuntime.h   # 运行时协调层，管理关闭状态和 worker 唤醒
+├── ThreadPoolRuntimeImpl.h# 运行时 inline 实现
+├── ThreadPoolImpl.h      # ThreadPool facade 的少量 inline 实现
+├── ThreadPoolSubmit.h    # submit / submit_with_stop 模板实现
+├── ThreadPoolWorker.h    # ThreadPoolWorker 类型、worker 循环和任务执行逻辑
+├── WorkerGroup.h         # worker 生命周期、扩缩容、join 管理
+├── WorkerGroupImpl.h     # WorkerGroup 创建 ThreadPoolWorker 的 inline 实现
+├── ThreadPoolOptions.h   # 运行模式和启动参数
+├── ThreadPoolStopToken.h # 协作式取消 token/source
+├── ThreadPoolTypeTraits.h# C++14/C++20 类型萃取兼容层
 ├── main.cpp              # 基础示例
 ├── test.cpp              # C++14 行为测试
 ├── test_coroutine.cpp    # C++20 协程调度测试
@@ -39,6 +48,17 @@
 └── docs/
     └── DESIGN.md         # 详细设计说明
 ```
+
+## 架构分层
+
+当前实现按职责拆成四层：
+
+- `ThreadPool`：对外 facade，保持使用方式简单。
+- `ThreadPoolRuntime`：运行时协调层，负责启动、关闭、worker 唤醒和跨层调用。
+- `TaskScheduler`：调度层，负责普通任务队列、worker 本地协程队列、work stealing、active 计数和 idle 等待。
+- `WorkerGroup` / `ThreadPoolWorker`：执行层，负责线程生命周期和 worker 循环。
+
+锁策略采用“谁拥有数据，谁管理锁”：队列由 `SafeQueue` 自己加锁，调度状态由 `TaskScheduler` 加锁，线程容器由 `WorkerGroup` 加锁，运行时只保护启动/关闭状态和唤醒条件。
 
 ## 快速开始
 
@@ -90,7 +110,8 @@ int main()
 
 ```cpp
 threadpool::ThreadPool::Options options;
-options.worker_count = 4;
+options.min_workers = 4;
+options.max_workers = 4;
 options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadOnly;
 
 threadpool::ThreadPool pool(options);
@@ -219,7 +240,8 @@ threadpool::ThreadPool pool(
 
 ```cpp
 threadpool::ThreadPool::Options options;
-options.worker_count = 4;
+options.min_workers = 4;
+options.max_workers = 4;
 options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine;
 
 threadpool::ThreadPool pool(options);
@@ -324,6 +346,27 @@ benchmark 用于观察不同 worker 数下的吞吐和简单调度延迟，不�
 - `p50_us` / `p95_us` / `p99_us`：任务从提交到开始执行的延迟采样。
 
 对极短任务来说，worker 数量增加不一定提升吞吐，因为共享队列锁和线程调度开销可能超过并行收益。
+
+## 当前验证结果
+
+最近一次本地 Release 验证：
+
+```powershell
+cmake --build build --config Release --parallel
+ctest --test-dir build --build-config Release --output-on-failure
+.\threadpool_stress.exe 20000 4 4
+.\threadpool_mode_compare.exe 20000 2000 10 4
+.\threadpool_benchmark.exe
+```
+
+结果：
+
+- CTest：3/3 通过，覆盖普通任务、协程调度和轻量压力测试。
+- 压力测试：20000 个 future 任务完成，多提交线程、排队任务取消和协作式取消均通过。
+- 模式对比：纯线程模式约 68965 ops/sec，线程 + 协程模式约 385964 ops/sec。
+- Benchmark 延迟采样：6 worker 下 p50 约 24 us，p95 约 57 us，p99 约 80 us。
+
+性能数据只代表当前机器和当前编译配置，不作为跨平台性能承诺。
 
 ## 手动编译
 

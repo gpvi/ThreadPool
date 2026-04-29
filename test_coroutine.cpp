@@ -115,7 +115,7 @@ int main()
 	{
 		ThreadPool pool(1);
 		assert(pool.execution_mode() == ThreadPool::ExecutionMode::ThreadOnly);
-		assert(!pool.coroutine_enabled());
+		assert(!pool.is_coroutine_enabled());
 
 		auto task = rejected_coroutine_schedule(pool);
 		bool threw = false;

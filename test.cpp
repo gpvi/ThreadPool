@@ -167,6 +167,38 @@ void test_submit_with_stop_observes_requested_stop()
 	assert(result.get() < 100);
 }
 
+void test_dynamic_workers_can_retire_and_grow_again()
+{
+	ThreadPool::Options options;
+	options.min_workers = 1;
+	options.max_workers = 4;
+	options.idle_timeout = std::chrono::milliseconds(50);
+
+	ThreadPool pool(options);
+	std::atomic<int> counter{0};
+
+	for (int round = 0; round < 2; ++round) {
+		std::vector<std::future<void>> futures;
+		for (int i = 0; i < 40; ++i) {
+			futures.push_back(pool.submit([&counter] {
+				std::this_thread::sleep_for(std::chrono::milliseconds(2));
+				counter.fetch_add(1);
+			}));
+		}
+
+		for (auto &future : futures) {
+			future.get();
+		}
+
+		pool.wait_idle();
+		std::this_thread::sleep_for(std::chrono::milliseconds(120));
+		assert(pool.worker_count() >= 1);
+		assert(pool.worker_count() <= 4);
+	}
+
+	assert(counter.load() == 80);
+}
+
 int main()
 {
 	test_submit_returns_future_value();
@@ -179,5 +211,6 @@ int main()
 	test_namespace_type_is_available();
 	test_wait_idle_for_times_out_and_then_succeeds();
 	test_submit_with_stop_observes_requested_stop();
+	test_dynamic_workers_can_retire_and_grow_again();
 	return 0;
 }

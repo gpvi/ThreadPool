@@ -51,7 +51,8 @@ flowchart TD
 
 主要组件：
 
-- `threadpool::ThreadPool`：线程池主体，负责 worker 创建、任务提交、关闭、状态查询。
+- `threadpool::ThreadPool`：对外 facade，负责暴露任务提交、关闭、状态查询和协程 awaiter。
+- `threadpool::ThreadPoolRuntime`：运行时协调层，负责关闭状态、worker 唤醒、启动关闭流程，以及连接调度器和 worker 组。
 - `ExecutionMode`：运行模式，决定线程池是否启用协程调度能力。
 - `Options`：线程池启动参数，包含 worker 数量和运行模式。
 - `threadpool::SafeQueue<T>`：线程安全队列，保存待执行任务。
@@ -61,6 +62,30 @@ flowchart TD
 - `StopSource` / `StopToken`：协作式取消机制。
 - `ScheduleAwaiter`：把协程切换到线程池 worker。
 - `YieldAwaiter`：让当前协程主动让出 worker，并重新排队等待恢复。
+
+当前项目采用 header-only 拆分方式，外部仍只需要包含：
+
+```cpp
+#include "ThreadPool.h"
+```
+
+内部文件职责：
+
+```text
+ThreadPool.h           对外主入口、ThreadPool 声明和模板 submit
+ThreadPoolRuntime.h    运行时协调层，集中启动、关闭和 worker 唤醒
+ThreadPoolRuntimeImpl.h ThreadPoolRuntime inline 实现
+TaskScheduler.h        普通任务队列、worker 协程队列、work stealing、空闲等待
+ThreadPoolImpl.h       ThreadPool facade 的少量 inline 实现
+ThreadPoolSubmit.h     submit / submit_with_stop 模板实现
+ThreadPoolWorker.h     ThreadPoolWorker 类型、worker 循环和任务执行逻辑
+WorkerGroup.h          worker 生命周期、扩缩容、join 管理
+WorkerGroupImpl.h      WorkerGroup 创建 ThreadPoolWorker 的 inline 实现
+ThreadPoolOptions.h    关闭模式、运行模式、启动参数
+ThreadPoolStopToken.h  协作式取消 token/source
+ThreadPoolTypeTraits.h C++14/C++20 类型萃取兼容层
+SafeQueue.h            线程安全队列
+```
 
 ## 任务模型
 
@@ -114,6 +139,70 @@ sequenceDiagram
 
 当前线程池使用的是固定线程数、普通任务全局 FIFO 队列、worker 本地协程队列、条件变量唤醒的调度策略。
 
+### 分层职责划分
+
+当前实现按 facade、runtime、scheduler、worker group、worker 执行单元拆分：
+
+`ThreadPool` 负责：
+
+- 提供任务提交、等待空闲、状态查询等对外接口。
+- 持有 `ThreadPoolRuntime`，不直接管理任务队列、worker 线程数组和底层锁。
+- 提供 `schedule()` / `yield()` 这类协程入口，并转发给 runtime。
+
+`ThreadPoolRuntime` 负责：
+
+- 管理运行时关闭状态、启动状态和 worker 唤醒条件变量。
+- 协调 `TaskScheduler`、`WorkerGroup` 和 `ThreadPoolWorker`。
+- 在提交任务、协程恢复、关闭线程池时完成跨层调度。
+- 给 worker 提供 `wait_for_work()` / `finish_work()` 这样的内部接口，避免 worker 直接访问上层私有字段。
+
+`TaskScheduler` 负责：
+
+- 保存全局普通任务队列。
+- 保存 worker 本地协程队列。
+- 选择协程初始调度目标 worker。
+- 执行 work stealing。
+- 维护 active task 计数。
+- 判断线程池是否空闲。
+- 提供 `wait_idle`、排队任务数、排队协程数等调度状态能力。
+- 管理自己的调度状态锁和 idle 条件变量。
+
+`ThreadPoolWorker` 负责：
+
+- 持有所属 runtime 指针和 worker id。
+- 等待任务到达或空闲超时。
+- 优先执行本地协程恢复任务。
+- 回退执行全局普通任务。
+- 在空闲时尝试偷取其他 worker 的协程恢复任务。
+- 执行任务并更新活跃任务计数。
+
+这样拆分后，pool 更像调度器和资源管理者，worker 更像执行单元。
+
+`WorkerGroup` 负责：
+
+- 保存 worker 线程列表。
+- 维护 live worker 数量。
+- 分配 worker id。
+- 根据队列压力动态创建 worker。
+- 处理空闲 worker 是否可以退出。
+- 记录已空闲退出的 worker，并在后续扩容前回收对应 thread 对象。
+- 在线程池关闭时 join 所有 worker。
+- 管理自己的线程容器锁，外部不直接操作线程数组。
+
+拆分后，`ThreadPool` 更像 facade，`ThreadPoolRuntime` 负责“运行时怎么协调”，`TaskScheduler` 负责“任务怎么排”，`WorkerGroup` 负责“线程怎么管”，`ThreadPoolWorker` 负责“线程怎么跑”。
+
+### 锁管理策略
+
+项目采用“谁拥有数据，谁管理锁”的策略：
+
+- `SafeQueue` 内部保护自己的队列 push / pop / size / clear。
+- `TaskScheduler` 保护 active task 计数、协程轮询下标和 idle 等待条件。
+- `WorkerGroup` 保护 worker 线程数组和已退休 worker 记录。
+- `ThreadPoolRuntime` 只保护启动/关闭状态和 worker 唤醒条件。
+- `ThreadPoolWorker` 不直接访问任何上层锁，只通过 runtime 方法取任务、完成任务和退出。
+
+这种拆分避免了一个大锁覆盖所有逻辑，也避免底层组件依赖上层对象的私有状态。代价是跨层状态变化需要更明确的通知，例如任务入队后由 runtime 负责唤醒 worker，任务完成后由 scheduler 判断是否进入 idle。
+
 ### 运行模式
 
 线程池支持两种运行模式：
@@ -140,7 +229,8 @@ threadpool::ThreadPool pool(
 
 ```cpp
 threadpool::ThreadPool::Options options;
-options.worker_count = 4;
+options.min_workers = 4;
+options.max_workers = 4;
 options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine;
 
 threadpool::ThreadPool pool(options);

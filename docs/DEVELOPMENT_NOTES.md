@@ -537,7 +537,92 @@ README 内容不断追加后变得像教程笔记，项目首页信息过重。
 
 这样读者可以根据目的选择阅读路径。
 
-## 26. 简历表达需要突出难点而不是堆接口名
+## 26. 头文件需要按职责拆分
+
+### 问题
+
+线程池功能不断增加后，`ThreadPool.h` 同时包含配置、取消令牌、类型兼容层、线程池声明、模板提交和 worker 实现，阅读成本变高。
+
+### 原因
+
+项目从单文件教学示例演进到小型库组件后，功能边界变多。如果所有内容继续堆在主入口头文件里，后续维护会变困难。
+
+### 解决策略
+
+保持 `#include "ThreadPool.h"` 作为唯一对外入口，同时把内部职责拆到多个头文件：
+
+```text
+ThreadPoolOptions.h    运行模式和启动参数
+ThreadPoolStopToken.h  协作式取消
+ThreadPoolTypeTraits.h C++ 标准兼容类型萃取
+ThreadPoolImpl.h       pool 级调度、扩缩容、协程队列实现
+ThreadPoolSubmit.h     submit / submit_with_stop 模板实现
+ThreadPoolWorker.h     ThreadPoolWorker 类型、worker 循环和任务执行逻辑
+TaskScheduler.h        普通任务、协程队列、work stealing、空闲等待
+WorkerGroup.h          worker 生命周期、扩缩容、join 管理
+WorkerGroupImpl.h      WorkerGroup 创建 ThreadPoolWorker 的 inline 实现
+SafeQueue.h            线程安全队列
+```
+
+这样既保持用户使用简单，又让内部实现边界更清晰。
+
+进一步拆分后，`ThreadPoolWorker` 不再只是一个函数实现文件，而是一个独立执行单元类型。`ThreadPool` 创建 worker，worker 自己负责等待、取任务、执行任务和空闲退出。
+
+后续又引入 `TaskScheduler`，把全局任务队列、worker 本地协程队列、active task 计数、空闲等待、协程恢复入队和 work stealing 从 `ThreadPool` 中拿出来。这样 `ThreadPool` 更接近对外 facade，`TaskScheduler` 负责调度策略，`ThreadPoolWorker` 负责执行循环。
+
+再进一步引入 `WorkerGroup`，把 worker 线程数组、live worker 计数、worker id 分配、动态扩容、空闲回收和 join 从 `ThreadPool` 中拿出来。这样线程池架构从“一个大类”变成：
+
+```text
+ThreadPool      对外 facade 和生命周期入口
+TaskScheduler   任务/协程调度策略
+WorkerGroup     worker 生命周期管理
+ThreadPoolWorker worker 执行循环
+```
+
+## 27. WorkerGroup 创建线程需要异常安全
+
+### 问题
+
+如果先增加 live worker 计数，再创建 `std::thread`，一旦线程创建或 vector 扩容失败，计数会显示有 worker 存活，但实际线程并没有创建成功。
+
+### 原因
+
+线程创建和容器扩容都可能抛异常。资源计数必须和真实资源创建保持一致。
+
+### 解决策略
+
+调整顺序：
+
+```text
+先创建并保存 std::thread
+创建成功后再增加 live worker 计数
+```
+
+这样异常发生时不会留下错误的 worker 计数。
+
+## 28. 空闲 worker 退出后 thread 对象不能长期堆积
+
+### 问题
+
+动态扩缩容后，worker 线程可能因为空闲超时退出。如果只减少 live worker 数量，但不回收对应的 `std::thread` 对象，长期运行后 `workers_` 容器会持续增长。
+
+### 原因
+
+退出的线程对象仍然保存在 `WorkerGroup` 中，需要由其他线程 join 后才能安全移除。worker 线程不能 join 自己。
+
+### 解决策略
+
+worker 退出时记录自己的 `thread::id`，由 `WorkerGroup` 在下次扩容前执行回收：
+
+```text
+worker 退出 -> 记录 retired id
+下一次 spawn 前 -> join 并 erase retired thread
+shutdown -> join_all 清理所有 thread
+```
+
+这样既避免 worker 自己 join 自己，也避免历史 thread 对象长期堆积。
+
+## 29. 简历表达需要突出难点而不是堆接口名
 
 ### 问题
 
