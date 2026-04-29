@@ -1,6 +1,11 @@
-#include<bits/stdc++.h>
-#include"ThreadPool.h"
-#include<random>
+#include "ThreadPool.h"
+
+#include <chrono>
+#include <functional>
+#include <iostream>
+#include <random>
+#include <thread>
+
 using namespace std;
 
 // 设置线程睡眠时间
