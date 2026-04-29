@@ -170,7 +170,7 @@ void benchmark_latency_sample(const std::size_t workers)
 {
 	const std::size_t samples = 2000;
 	threadpool::ThreadPool pool(workers);
-	std::vector<std::future<long long>> futures;
+	std::vector<std::future<Microseconds::rep>> futures;
 	futures.reserve(samples);
 
 	for (std::size_t i = 0; i < samples; ++i) {
@@ -182,7 +182,7 @@ void benchmark_latency_sample(const std::size_t workers)
 		}));
 	}
 
-	std::vector<long long> latencies;
+	std::vector<Microseconds::rep> latencies;
 	latencies.reserve(samples);
 	for (auto &future : futures) {
 		latencies.push_back(future.get());

@@ -22,6 +22,18 @@
 
 namespace threadpool {
 
+namespace detail {
+
+#if (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L
+template <typename F, typename... Args>
+using invoke_result_t = std::invoke_result_t<F, Args...>;
+#else
+template <typename F, typename... Args>
+using invoke_result_t = typename std::result_of<F(Args...)>::type;
+#endif
+
+} // namespace detail
+
 class ThreadPool {
 public:
 	enum class ShutdownMode {
@@ -259,8 +271,8 @@ public:
 	
 	
 	template <typename F,typename... Args>
-	auto submit(F &&f, Args &&...args) -> std::future<typename std::result_of<F(Args...)>::type> {
-		using return_type = typename std::result_of<F(Args...)>::type;
+	auto submit(F &&f, Args &&...args) -> std::future<detail::invoke_result_t<F, Args...>> {
+		using return_type = detail::invoke_result_t<F, Args...>;
 		// 调用打包
 //		function<decltype(f(args...))()> func = bind(forward<F>(f),forward<Args>(args));
 		std::function<return_type()> func = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
@@ -287,7 +299,7 @@ public:
 
 	template <typename F, typename... Args>
 	auto submit_with_stop(StopToken token, F &&f, Args &&...args)
-		-> std::future<typename std::result_of<F(StopToken, Args...)>::type> {
+		-> std::future<detail::invoke_result_t<F, StopToken, Args...>> {
 		return submit(
 			std::forward<F>(f),
 			std::move(token),
