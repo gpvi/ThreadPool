@@ -13,12 +13,14 @@
 
 - 固定数量 worker 线程，复用线程资源，减少频繁创建线程的开销。
 - 基于线程安全 FIFO 队列和条件变量完成任务调度、阻塞等待和唤醒。
+- 支持运行模式切换：纯线程模式、线程 + 协程模式。
+- 在线程 + 协程模式下，每个 worker 维护自己的协程队列。
 - 支持普通函数、lambda、成员函数等任务形式。
 - 使用 `std::packaged_task` 和 `std::future` 支持异步返回值和异常传播。
 - 支持自动启动、析构自动关闭、优雅排空和取消排队任务。
 - 支持等待线程池空闲、查询排队任务数和活跃任务数。
 - 支持 `StopSource` / `StopToken` 协作式取消。
-- 在 C++20 下支持 `co_await pool.schedule()`，让协程恢复到线程池 worker 执行。
+- 在 C++20 下支持 `co_await pool.schedule()` 和 `co_await pool.yield()`，让协程切换到线程池 worker 并主动让出执行权。
 - 提供单元测试、协程测试、压力测试和 benchmark。
 
 ## 项目结构
@@ -33,6 +35,7 @@
 ├── test_coroutine.cpp    # C++20 协程调度测试
 ├── stress_test.cpp       # 压力测试
 ├── benchmark.cpp         # 基准测试
+├── mode_compare.cpp      # 纯线程 / 线程+协程模式对比
 └── docs/
     └── DESIGN.md         # 详细设计说明
 ```
@@ -57,6 +60,8 @@ benchmark 不加入默认 CTest，因为性能结果容易受机器配置、系�
 
 ## 基本用法
 
+默认构造是纯线程模式，适合普通任务提交：
+
 ```cpp
 #include "ThreadPool.h"
 
@@ -80,6 +85,16 @@ int main()
 - 任务完成后，`future.get()` 返回结果。
 - 任务抛异常时，异常会在 `future.get()` 中重新抛出。
 - 任务没有返回值时，返回 `std::future<void>`。
+
+也可以使用参数对象显式配置线程池：
+
+```cpp
+threadpool::ThreadPool::Options options;
+options.worker_count = 4;
+options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadOnly;
+
+threadpool::ThreadPool pool(options);
+```
 
 ## 任务提交
 
@@ -160,6 +175,7 @@ pool.wait_idle_until(deadline);
 
 pool.worker_count();
 pool.queued_tasks();
+pool.queued_coroutines();
 pool.active_tasks();
 pool.is_shutdown();
 ```
@@ -190,7 +206,26 @@ stop_source.request_stop();
 
 ## 协程调度
 
-在支持 C++20 coroutine 的编译器下，可以使用：
+默认模式是纯线程模式。如果需要协程调度，需要在创建线程池时显式启用：
+
+```cpp
+threadpool::ThreadPool pool(
+	4,
+	threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine
+);
+```
+
+也可以通过参数对象启用：
+
+```cpp
+threadpool::ThreadPool::Options options;
+options.worker_count = 4;
+options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine;
+
+threadpool::ThreadPool pool(options);
+```
+
+启用后，在支持 C++20 coroutine 的编译器下可以使用：
 
 ```cpp
 co_await pool.schedule();
@@ -209,6 +244,40 @@ CoroutineTask work(threadpool::ThreadPool &pool)
 ```
 
 当前协程支持是轻量调度入口，不是完整的 `Task<T>` 协程框架。
+
+如果协程已经运行在线程池 worker 上，可以使用：
+
+```cpp
+co_await pool.yield();
+```
+
+它会让当前协程挂起，并把恢复动作重新放回线程池队列。这样一个 worker 线程可以在多个协程之间协作式轮转：
+
+```cpp
+CoroutineTask work(threadpool::ThreadPool &pool)
+{
+	co_await pool.schedule();
+	step1();
+
+	co_await pool.yield();
+	step2();
+
+	co_await pool.yield();
+	step3();
+}
+```
+
+注意：`yield()` 是协作式让出。协程只有主动 `co_await pool.yield()`，其他协程才有机会更快获得 worker 执行权。
+
+如果在纯线程模式下调用 `schedule()` 或 `yield()`，会抛出 `std::runtime_error`。
+
+当前协程调度策略：
+
+- 普通任务进入全局任务队列。
+- `schedule()` 将协程恢复动作按轮询策略放入某个 worker 的本地协程队列。
+- `yield()` 优先将当前协程重新放回当前 worker 的本地协程队列。
+- worker 优先执行自己的协程队列，但会通过连续协程执行配额避免普通任务长期饥饿。
+- worker 本地协程队列为空时，可以从其他 worker 的协程队列偷取恢复任务。
 
 ## 压力测试
 
@@ -266,7 +335,29 @@ g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread test.cpp -o threadpool_tests.
 g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test_coroutine.cpp -o threadpool_coroutine_tests.exe
 g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread stress_test.cpp -o threadpool_stress.exe
 g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread benchmark.cpp -o threadpool_benchmark.exe
+g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread mode_compare.cpp -o threadpool_mode_compare.exe
 ```
+
+## 模式对比
+
+`mode_compare.cpp` 用于对比纯线程模式和线程 + 协程模式：
+
+```powershell
+.\threadpool_mode_compare.exe <tasks> <coroutines> <yields_per_coroutine> <workers>
+```
+
+示例：
+
+```powershell
+.\threadpool_mode_compare.exe 20000 2000 10 4
+```
+
+输出包含：
+
+- `thread_only`：纯线程模式下提交普通任务的耗时和吞吐。
+- `thread_and_coroutine`：线程 + 协程模式下多个协程多次 `yield` 的耗时和吞吐。
+
+这个对比主要用于观察协程调度的额外成本。协程模式的价值不在于让极短任务更快，而在于让长流程任务可以主动挂起、让出 worker，并用较少线程承载更多轻量执行单元。
 
 ## 适用场景
 
