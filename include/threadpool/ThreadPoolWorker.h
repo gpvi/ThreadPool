@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 namespace threadpool {
 
 class ThreadPoolWorker {
@@ -35,8 +37,10 @@ public:
             try {
                 work.task();
             } catch (...) {
-                // packaged_task 会将异常保存到 future。
-                // 这里兜底，防止非 packaged_task 任务导致 worker 线程异常退出。
+                const auto &cb = runtime_->on_exception();
+                if (cb) {
+                    cb(std::current_exception());
+                }
             }
 
             runtime_->finish_work(work.popped_coroutine, coroutine_burst);

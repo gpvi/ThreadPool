@@ -1,0 +1,9 @@
+{
+  "name": "threadpool",
+  "version": "0.9.0",
+  "description": "Header-only C++14/20 thread pool with native C++20 coroutine scheduling, work stealing, and dynamic worker scaling",
+  "homepage": "https://github.com/user/threadpool",
+  "license": "MIT",
+  "supports": "!uwp",
+  "dependencies": []
+}

@@ -1,10 +1,15 @@
 #pragma once
 
+#include <condition_variable>
+#include <mutex>
+#include <stdexcept>
+
 namespace threadpool {
 
 inline ThreadPoolRuntime::ThreadPoolRuntime(const ThreadPoolOptions &options)
     : execution_mode_(options.execution_mode),
-      scheduler_(options.execution_mode, options.max_workers, options.coroutine_burst_limit),
+      on_exception_(options.on_exception),
+      scheduler_(options.execution_mode, options.max_workers, options.coroutine_burst_limit, options.max_coroutine_queue_size),
       workers_(options.min_workers, options.max_workers, options.idle_timeout)
 {
     if (workers_.min_workers() == 0) {
@@ -13,6 +18,10 @@ inline ThreadPoolRuntime::ThreadPoolRuntime(const ThreadPoolOptions &options)
 
     if (workers_.max_workers() < workers_.min_workers()) {
         throw std::invalid_argument("max_workers must be >= min_workers");
+    }
+
+    if (workers_.max_workers() > 4096) {
+        throw std::invalid_argument("max_workers must not exceed 4096");
     }
 }
 
@@ -76,6 +85,46 @@ inline void ThreadPoolRuntime::shutdown(ShutdownMode mode)
     workers_.join_all();
 }
 
+template <typename Rep, typename Period>
+inline bool ThreadPoolRuntime::shutdown_for(
+    ShutdownMode mode,
+    const std::chrono::duration<Rep, Period> &timeout
+)
+{
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (shutdown_) {
+            return true;
+        }
+
+        shutdown_ = true;
+
+        if (mode == ShutdownMode::CancelPending) {
+            scheduler_.cancel_pending_tasks();
+        }
+    }
+
+    scheduler_.notify_idle_if_needed();
+    work_cv_.notify_all();
+
+    return workers_.join_all_for(timeout);
+}
+
+template <typename Clock, typename Duration>
+inline bool ThreadPoolRuntime::shutdown_until(
+    ShutdownMode mode,
+    const std::chrono::time_point<Clock, Duration> &deadline
+)
+{
+    return shutdown_for(
+        mode,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now()
+        )
+    );
+}
+
 inline void ThreadPoolRuntime::submit_task(Task task)
 {
     {
@@ -100,21 +149,23 @@ inline ThreadPoolRuntime::WorkerWork ThreadPoolRuntime::wait_for_work(
     WorkerWork work;
     std::unique_lock<std::mutex> lock(mutex_);
 
-    const bool awakened = work_cv_.wait_for(
-        lock,
-        workers_.idle_timeout(),
-        [this, worker_id] {
-            return shutdown_ || scheduler_.has_any_work_for_worker(worker_id);
-        }
-    );
+    const bool can_exit = workers_.should_exit_on_idle();
+    const bool awakened = can_exit
+        ? work_cv_.wait_for(
+              lock,
+              workers_.idle_timeout(),
+              [this, worker_id] {
+                  return shutdown_ || scheduler_.has_any_work_for_worker(worker_id);
+              })
+        : (work_cv_.wait(lock, [this, worker_id] {
+               return shutdown_ || scheduler_.has_any_work_for_worker(worker_id);
+           }),
+           true);
 
     if (!awakened) {
-        if (workers_.should_exit_on_idle()) {
-            retire_current_worker();
-            scheduler_.notify_idle_if_needed();
-            work.exit = true;
-        }
-
+        retire_current_worker();
+        scheduler_.notify_idle_if_needed();
+        work.exit = true;
         return work;
     }
 
@@ -209,8 +260,12 @@ inline std::size_t ThreadPoolRuntime::queued_coroutines() const
 
 inline std::size_t ThreadPoolRuntime::active_tasks() const
 {
-    std::unique_lock<std::mutex> lock(mutex_);
     return scheduler_.active_tasks();
+}
+
+inline std::size_t ThreadPoolRuntime::max_coroutine_queue_size() const noexcept
+{
+    return scheduler_.max_coroutine_queue_size();
 }
 
 inline ExecutionMode ThreadPoolRuntime::execution_mode() const noexcept
@@ -251,18 +306,18 @@ inline void ThreadPoolRuntime::enqueue_coroutine_resume(
         }
 
         std::size_t target = 0;
-
-        if (
+        const bool is_current =
             prefer_current_worker
             && current_runtime() == this
-            && current_worker_id() < workers_.max_workers()
-        ) {
+            && current_worker_id() < workers_.max_workers();
+
+        if (is_current) {
             target = current_worker_id();
         }
 
         scheduler_.push_coroutine(
             handle,
-            prefer_current_worker && current_runtime() == this,
+            is_current,
             target
         );
 

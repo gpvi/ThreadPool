@@ -1,4 +1,5 @@
-#include "ThreadPool.h"
+#define THREADPOOL_USE_GLOBAL_NAMESPACE
+#include "threadpool/ThreadPool.h"
 
 #include <atomic>
 #include <cassert>
@@ -82,6 +83,23 @@ CoroutineTask scheduled_before_shutdown(ThreadPool &pool, std::atomic<int> &valu
 	value.store(1);
 }
 
+// Work stealing: coroutines assigned to one worker get stolen by idle workers
+CoroutineTask stealable_work(ThreadPool &pool, std::atomic<int> &counter)
+{
+	co_await pool.schedule();
+	counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Burst limit: after exceeding coroutine_burst_limit, worker picks up global task
+CoroutineTask bursty_work(ThreadPool &pool, std::atomic<int> &counter)
+{
+	co_await pool.schedule();
+	for (int i = 0; i < 3; ++i) {
+		counter.fetch_add(1, std::memory_order_relaxed);
+		co_await pool.yield();
+	}
+}
+
 int main()
 {
 	{
@@ -136,6 +154,71 @@ int main()
 		task.get();
 
 		assert(value.load() == 1);
+	}
+
+	// Work stealing: multiple workers pull coroutines from each other's queues
+	{
+		ThreadPool pool(2, ThreadPool::ExecutionMode::ThreadAndCoroutine);
+		std::atomic<int> counter{0};
+		std::vector<CoroutineTask> tasks;
+		for (int i = 0; i < 20; ++i) {
+			tasks.push_back(stealable_work(pool, counter));
+		}
+		for (auto &task : tasks) {
+			task.get();
+		}
+		assert(counter.load() == 20);
+	}
+
+	// Coroutine burst limit: global tasks interleave with coroutine bursts
+	{
+		ThreadPool::Options options;
+		options.min_workers = 1;
+		options.max_workers = 1;
+		options.execution_mode = ThreadPool::ExecutionMode::ThreadAndCoroutine;
+		options.coroutine_burst_limit = 2;
+		ThreadPool pool(options);
+		std::atomic<int> counter{0};
+
+		auto coro = bursty_work(pool, counter);
+		pool.submit([&counter] {
+			counter.fetch_add(100, std::memory_order_relaxed);
+		});
+		coro.get();
+		pool.wait_idle();
+
+		assert(counter.load() >= 103); // 3 from coroutine + at least 100 from task
+	}
+
+	// Coroutine queue size limit rejects excess coroutines
+	{
+		ThreadPool::Options options;
+		options.min_workers = 1;
+		options.max_workers = 1;
+		options.execution_mode = ThreadPool::ExecutionMode::ThreadAndCoroutine;
+		options.max_coroutine_queue_size = 1;
+		ThreadPool pool(options);
+
+		// Block the worker so the queue backs up
+		std::promise<void> blocker;
+		auto block_future = blocker.get_future();
+		pool.submit([&] {
+			block_future.get();
+		});
+
+		std::atomic<int> value{0};
+		auto first = scheduled_before_shutdown(pool, value);
+		// Queue should have 1 coroutine (first), pushing another should fail
+		bool threw = false;
+		try {
+			auto second = scheduled_before_shutdown(pool, value);
+			second.get();
+		} catch (const std::runtime_error &) {
+			threw = true;
+		}
+		blocker.set_value();
+		first.get();
+		assert(threw);
 	}
 	return 0;
 }

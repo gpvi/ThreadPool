@@ -12,7 +12,7 @@ on:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.os }} Release
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -34,3 +34,67 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --build-config Release --output-on-failure
+
+  tsan:
+    name: TSan (Thread Sanitizer)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Test
+        run: ctest --test-dir build --build-config Debug --output-on-failure
+        env:
+          TSAN_OPTIONS: second_deadlock_stack=1
+
+  asan-ubsan:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Test
+        run: ctest --test-dir build --build-config Debug --output-on-failure
+
+  valgrind:
+    name: Valgrind (memcheck)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Test under valgrind
+        run: |
+          valgrind --leak-check=full --error-exitcode=1 ./build/threadpool_tests
+          valgrind --leak-check=full --error-exitcode=1 ./build/threadpool_stress 5000 4 4

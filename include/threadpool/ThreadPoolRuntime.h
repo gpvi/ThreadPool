@@ -7,6 +7,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 
@@ -28,6 +30,7 @@ private:
     bool started_ = false;
 
     ExecutionMode execution_mode_ = ExecutionMode::ThreadOnly;
+    std::function<void(const std::exception_ptr &)> on_exception_;
 
     TaskScheduler scheduler_;
     WorkerGroup workers_;
@@ -49,6 +52,12 @@ public:
 
     void start(std::size_t worker_count);
     void shutdown(ShutdownMode mode = ShutdownMode::Drain);
+
+    template <typename Rep, typename Period>
+    bool shutdown_for(ShutdownMode mode, const std::chrono::duration<Rep, Period> &timeout);
+
+    template <typename Clock, typename Duration>
+    bool shutdown_until(ShutdownMode mode, const std::chrono::time_point<Clock, Duration> &deadline);
 
     void submit_task(Task task);
 
@@ -80,8 +89,14 @@ public:
     std::size_t queued_tasks() const;
     std::size_t queued_coroutines() const;
     std::size_t active_tasks() const;
+    std::size_t max_coroutine_queue_size() const noexcept;
     ExecutionMode execution_mode() const noexcept;
     bool coroutine_enabled() const noexcept;
+
+    const std::function<void(const std::exception_ptr &)> &on_exception() const noexcept
+    {
+        return on_exception_;
+    }
 
 #ifdef THREADPOOL_HAS_COROUTINE
     void enqueue_coroutine_resume(std::coroutine_handle<> handle, bool prefer_current_worker);

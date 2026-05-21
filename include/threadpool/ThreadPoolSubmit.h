@@ -1,6 +1,22 @@
 #pragma once
 
+#include <future>
+#include <memory>
+#include <tuple>
+#include <utility>
+
 namespace threadpool {
+namespace detail {
+
+#if !((defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L)
+template <typename ReturnType, typename F, typename Tuple, std::size_t... I>
+ReturnType apply_impl(F &&f, Tuple &&tuple, std::index_sequence<I...>)
+{
+    return std::forward<F>(f)(std::get<I>(std::forward<Tuple>(tuple))...);
+}
+#endif
+
+} // namespace detail
 
 template <typename F, typename... Args>
 auto ThreadPool::submit(F &&f, Args &&...args) -> std::future<detail::invoke_result_t<F, Args...>>
@@ -11,7 +27,7 @@ auto ThreadPool::submit(F &&f, Args &&...args) -> std::future<detail::invoke_res
 #if (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L
             return std::apply(std::move(func), std::move(tuple_args));
 #else
-            return call_impl<ReturnType>(
+            return detail::apply_impl<ReturnType>(
                 std::move(func),
                 std::move(tuple_args),
                 std::index_sequence_for<Args...>{}
@@ -39,13 +55,5 @@ auto ThreadPool::submit_with_stop(StopToken token, F &&f, Args &&...args)
         std::forward<Args>(args)...
     );
 }
-
-#if !((defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L)
-template <typename ReturnType, typename F, typename Tuple, std::size_t... I>
-ReturnType ThreadPool::call_impl(F &&f, Tuple &&tuple, std::index_sequence<I...>)
-{
-    return std::forward<F>(f)(std::get<I>(std::forward<Tuple>(tuple))...);
-}
-#endif
 
 } // namespace threadpool

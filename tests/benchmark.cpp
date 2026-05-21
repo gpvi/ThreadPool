@@ -1,4 +1,4 @@
-#include "ThreadPool.h"
+#include "threadpool/ThreadPool.h"
 
 #include <algorithm>
 #include <atomic>
@@ -97,6 +97,23 @@ void print_row(
 
 // 场景一：提交即忘（fire-and-wait）
 // 提交大量空任务 + wait_idle，测量纯调度吞吐
+// Baseline: raw std::async for comparison
+void benchmark_std_async(const std::size_t tasks) {
+    std::atomic<std::size_t> counter{0};
+    std::vector<std::future<void>> futures;
+    futures.reserve(tasks);
+    const auto elapsed_ms = measure_ms([&] {
+        for (std::size_t i = 0; i < tasks; ++i) {
+            futures.push_back(std::async(std::launch::async,
+                [&counter] { counter.fetch_add(1, std::memory_order_relaxed); }));
+        }
+        for (auto &f : futures) f.get();
+    });
+    if (counter.load() != tasks)
+        throw std::runtime_error("std::async counter mismatch");
+    print_row("std::async (baseline)", 0, tasks, elapsed_ms);
+}
+
 void benchmark_fire_and_wait(const std::size_t workers, const std::size_t tasks)
 {
     threadpool::ThreadPool pool(workers);
@@ -251,7 +268,8 @@ int main(int argc, char **argv)
         << std::setw(16) << "tasks/sec"
         << '\n';
 
-    // 对每种 worker 数量运行全部四组 benchmark
+    benchmark_std_async(config.tasks);
+
     for (const auto workers : config.workers) {
         benchmark_fire_and_wait(workers, config.tasks);
         benchmark_future_values(workers, config.tasks);

@@ -25,6 +25,7 @@ public:
 private:
     ExecutionMode execution_mode_;
     std::size_t coroutine_burst_limit_;
+    std::size_t max_coroutine_queue_size_;
     std::size_t active_tasks_ = 0;
     std::size_t next_coroutine_worker_ = 0;
     SafeQueue<Task> task_queue_;
@@ -36,17 +37,44 @@ public:
     TaskScheduler(
         ExecutionMode execution_mode,
         std::size_t worker_capacity,
-        std::size_t coroutine_burst_limit
+        std::size_t coroutine_burst_limit,
+        std::size_t max_coroutine_queue_size = 0
     )
         : execution_mode_(execution_mode),
-          coroutine_burst_limit_(coroutine_burst_limit == 0 ? 1 : coroutine_burst_limit)
+          coroutine_burst_limit_(coroutine_burst_limit == 0 ? 1 : coroutine_burst_limit),
+          max_coroutine_queue_size_(max_coroutine_queue_size)
     {
         coroutine_queues_.reserve(worker_capacity);
         for (std::size_t i = 0; i < worker_capacity; ++i) {
             coroutine_queues_.push_back(
-                std::unique_ptr<SafeQueue<Task>>(new SafeQueue<Task>())
+                std::make_unique<SafeQueue<Task>>()
             );
         }
+    }
+
+    std::size_t queued_tasks() const
+    {
+        return task_queue_.size();
+    }
+
+    std::size_t queued_coroutines() const
+    {
+        std::size_t total = 0;
+        for (const auto &queue : coroutine_queues_) {
+            total += queue->size();
+        }
+        return total;
+    }
+
+    std::size_t active_tasks() const
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return active_tasks_;
+    }
+
+    std::size_t max_coroutine_queue_size() const noexcept
+    {
+        return max_coroutine_queue_size_;
     }
 
     bool coroutine_enabled() const noexcept
@@ -212,26 +240,6 @@ public:
         });
     }
 
-    std::size_t queued_tasks() const
-    {
-        return task_queue_.size();
-    }
-
-    std::size_t queued_coroutines() const
-    {
-        std::size_t total = 0;
-        for (const auto &queue : coroutine_queues_) {
-            total += queue->size();
-        }
-        return total;
-    }
-
-    std::size_t active_tasks() const
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        return active_tasks_;
-    }
-
 #ifdef THREADPOOL_HAS_COROUTINE
     void push_coroutine(
         std::coroutine_handle<> handle,
@@ -250,6 +258,11 @@ public:
             std::unique_lock<std::mutex> lock(mutex_);
             target = next_coroutine_worker_;
             next_coroutine_worker_ = (next_coroutine_worker_ + 1) % coroutine_queues_.size();
+        }
+
+        if (max_coroutine_queue_size_ > 0
+            && coroutine_queues_[target]->size() >= max_coroutine_queue_size_) {
+            throw std::runtime_error("coroutine queue full for worker");
         }
 
         coroutine_queues_[target]->push([handle] {

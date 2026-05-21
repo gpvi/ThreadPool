@@ -1,4 +1,5 @@
-#include "ThreadPool.h"
+#define THREADPOOL_USE_GLOBAL_NAMESPACE
+#include "threadpool/ThreadPool.h"
 
 #include <atomic>
 #include <cassert>
@@ -167,6 +168,35 @@ void test_submit_with_stop_observes_requested_stop()
 	assert(result.get() < 100);
 }
 
+void test_wait_idle_until_times_out_and_then_succeeds()
+{
+	ThreadPool pool(1);
+	auto running = pool.submit([] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(150));
+	});
+
+	const auto deadline_fail = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+	assert(!pool.wait_idle_until(deadline_fail));
+	running.get();
+
+	const auto deadline_pass = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+	assert(pool.wait_idle_until(deadline_pass));
+}
+
+void test_max_workers_exceeds_hard_cap_throws()
+{
+	bool threw = false;
+	try {
+		ThreadPool::Options options;
+		options.min_workers = 1;
+		options.max_workers = 5000;
+		ThreadPool pool(options);
+	} catch (const std::invalid_argument &) {
+		threw = true;
+	}
+	assert(threw);
+}
+
 void test_dynamic_workers_can_retire_and_grow_again()
 {
 	ThreadPool::Options options;
@@ -211,6 +241,8 @@ int main()
 	test_namespace_type_is_available();
 	test_wait_idle_for_times_out_and_then_succeeds();
 	test_submit_with_stop_observes_requested_stop();
+	test_wait_idle_until_times_out_and_then_succeeds();
+	test_max_workers_exceeds_hard_cap_throws();
 	test_dynamic_workers_can_retire_and_grow_again();
 	return 0;
 }

@@ -12,18 +12,10 @@
 #include "ThreadPoolStopToken.h"
 #include "ThreadPoolTypeTraits.h"
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
-#include <functional>
 #include <future>
-#include <memory>
 #include <stdexcept>
-#include <thread>
-#include <tuple>
-#include <utility>
-#include <vector>
 
 namespace threadpool {
 
@@ -143,6 +135,20 @@ public:
         runtime_.shutdown(mode);
     }
 
+    template <typename Rep, typename Period>
+    bool shutdown_for(const std::chrono::duration<Rep, Period> &timeout,
+                      ShutdownMode mode = ShutdownMode::Drain)
+    {
+        return runtime_.shutdown_for(mode, timeout);
+    }
+
+    template <typename Clock, typename Duration>
+    bool shutdown_until(const std::chrono::time_point<Clock, Duration> &deadline,
+                        ShutdownMode mode = ShutdownMode::Drain)
+    {
+        return runtime_.shutdown_until(mode, deadline);
+    }
+
     void wait_idle()
     {
         runtime_.wait_idle();
@@ -195,6 +201,11 @@ public:
         return runtime_.active_tasks();
     }
 
+    std::size_t max_coroutine_queue_size() const noexcept
+    {
+        return runtime_.max_coroutine_queue_size();
+    }
+
     ExecutionMode execution_mode() const noexcept
     {
         return runtime_.execution_mode();
@@ -233,11 +244,6 @@ public:
     }
 #endif
 
-private:
-#if !((defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L)
-    template <typename ReturnType, typename F, typename Tuple, std::size_t... I>
-    static ReturnType call_impl(F &&f, Tuple &&tuple, std::index_sequence<I...>);
-#endif
 };
 
 } // namespace threadpool
@@ -248,4 +254,6 @@ private:
 #include "ThreadPoolImpl.h"
 #include "ThreadPoolSubmit.h"
 
+#ifdef THREADPOOL_USE_GLOBAL_NAMESPACE
 using ThreadPool = threadpool::ThreadPool;
+#endif

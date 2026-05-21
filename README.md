@@ -38,14 +38,25 @@ int value = 0;
 pool.submit([](int &out) { out = 100; }, std::ref(value)).get();
 ```
 
-### 3. 两种关闭方式
+### 3. 关闭方式
 
 ```cpp
-pool.shutdown();                                       // Drain：等已提交任务跑完
-pool.shutdown(ThreadPool::ShutdownMode::CancelPending); // 立即清空排队任务
+// Drain：等所有已提交任务跑完（默认）
+pool.shutdown();
+
+// 立即丢弃排队任务，正在跑的跑完
+pool.shutdown(ThreadPool::ShutdownMode::CancelPending);
+
+// 带超时：避免任务死锁导致进程永远退不出
+if (!pool.shutdown_for(std::chrono::seconds(5))) {
+    // false = 超时，剩余 worker 已 detach，可安全退出进程
+    // 注意：detach 的 worker 中正在跑的任务会继续执行到完成
+}
 ```
 
-析构函数会自动 shutdown，不怕忘。
+析构函数自动调用 `shutdown()`，不怕忘。
+
+> **超时关闭的语义**：`shutdown_for(timeout)` 返回 `false` 表示有 worker 未能在超时内退出。该 worker 的线程会被 detach，其正在执行的任务将继续运行直到完成。已排队的任务如果模式是 `CancelPending` 会丢弃，`Drain` 则尽可能执行但可能在超时后被跳过。
 
 ### 4. 查看线程池状态
 
@@ -55,6 +66,7 @@ pool.queued_tasks();                 // 还在排队的任务数
 pool.active_tasks();                 // 正在执行的任务数
 pool.queued_coroutines();            // 等待恢复的协程数
 pool.worker_count();                 // 存活 worker 数
+pool.max_coroutine_queue_size();     // 协程队列上限（0=无限制）
 pool.is_shutdown();                  // 是否已关闭
 ```
 
@@ -74,7 +86,32 @@ source.request_stop();               // 通知所有持有此 token 的任务
 future.get();                        // → "stopped"
 ```
 
-### 6. C++20 协程调度
+### 6. 协程队列容量限制
+
+```cpp
+ThreadPool::Options options;
+options.execution_mode = ThreadPool::ExecutionMode::ThreadAndCoroutine;
+options.max_coroutine_queue_size = 256;  // 每 worker 协程队列上限
+
+ThreadPool pool(options);
+// 队列满时，新的 co_await pool.schedule() 抛出 std::runtime_error
+```
+
+### 7. 任务异常回调
+
+```cpp
+ThreadPool::Options options;
+options.on_exception = [](const std::exception_ptr &ep) {
+    try { std::rethrow_exception(ep); }
+    catch (const std::exception &e) {
+        log_error("worker task failed: {}", e.what());
+    }
+};
+ThreadPool pool(options);
+// 非 packaged_task 任务的异常不再静默丢失
+```
+
+### 8. C++20 协程调度
 
 ```cpp
 // 构造时显式启用
@@ -101,7 +138,7 @@ CoroutineTask work(ThreadPool &pool, std::vector<int> &steps, int id) {
 // 一个 worker 线程可以在多个协程之间协作式轮转
 ```
 
-### 7. 动态扩缩容
+### 9. 动态扩缩容
 
 ```cpp
 ThreadPool::Options options;
@@ -123,7 +160,32 @@ ThreadPool pool(options);
 - 完整的 `Task<T>` 协程框架
 - 定时器和 I/O 事件
 
-项目定位是**结构清晰、可测试、可扩展的并发组件**，不是高性能运行时。
+---
+
+## 安装
+
+### CMake install
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --install build --prefix /usr/local
+```
+
+```cmake
+# 项目中使用
+find_package(threadpool REQUIRED)
+target_link_libraries(my_app PRIVATE threadpool)
+```
+
+### vcpkg
+
+```bash
+vcpkg install threadpool
+```
+
+### 手动
+
+复制 `include/threadpool/` 到项目中，`#include "threadpool/ThreadPool.h"`。
 
 ---
 
