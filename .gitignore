@@ -41,3 +41,5 @@ compile_commands.json
 *.layout
 *.user
 *.log
+docs/DEVELOPMENT_NOTES.md
+docs/INTERVIEW_QUESTIONS.md
