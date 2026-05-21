@@ -2,6 +2,8 @@
 
 header-only C++ 线程池库。C++14 基线，C++20 协程条件启用，跨 Windows / Linux（GCC + MSVC）。
 
+CI 质量门禁：Release（ubuntu + windows）+ TSan + ASan/UBSan + Valgrind。
+
 ## 能干什么
 
 ### 1. 提交任务，拿到 future 返回值
@@ -199,21 +201,22 @@ cmake --build build --config Release --parallel
 ctest --test-dir build --build-config Release --output-on-failure
 ```
 
-CTest 默认跑 3 项：行为测试 + 协程测试 + 轻量压力测试。
+CTest 默认跑 3 项：行为测试（13 cases）+ 协程测试（7 cases）+ 轻量压力测试。
 
 ### 手动编译
 
 ```bash
-g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test.cpp -o threadpool_tests
-g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test_coroutine.cpp -o threadpool_coroutine_tests
+g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread tests/test.cpp -o threadpool_tests
+g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread tests/test_coroutine.cpp -o threadpool_coroutine_tests
 ```
 
 ### 压力测试 & Benchmark
 
 ```bash
-./threadpool_stress.exe 50000 8 8        # <tasks> <workers> <submitters>
-./threadpool_benchmark.exe 100000 4      # <tasks> <submitters>
-./threadpool_mode_compare.exe 20000 2000 10 4  # <tasks> <coroutines> <yields> <workers>
+./build/threadpool_stress.exe 50000 8 8           # <tasks> <workers> <submitters>
+./build/threadpool_benchmark.exe 100000 4         # <tasks> <submitters>
+./build/threadpool_mode_compare.exe 20000 2000 10 4  # <tasks> <coroutines> <yields> <workers>
+./build/threadpool_long_run.exe 30 4              # <duration_sec> <workers>
 ```
 
 ---
@@ -225,5 +228,3 @@ g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test_coroutine.cpp -o threadp
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 代码架构、组件职责、数据流、锁层次、文件组织 |
 | [DESIGN.md](docs/DESIGN.md) | 设计决策、调度策略、trade-off、取舍分析 |
 | [IMPLEMENTATION_PRINCIPLE.md](docs/IMPLEMENTATION_PRINCIPLE.md) | 逐层实现原理、源码追踪 |
-| [INTERVIEW_QUESTIONS.md](docs/INTERVIEW_QUESTIONS.md) | 项目面试问题与回答要点 |
-| [DEVELOPMENT_NOTES.md](docs/DEVELOPMENT_NOTES.md) | 29 个开发问题的原因分析和解决策略 |
