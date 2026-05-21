@@ -160,28 +160,32 @@ public:
     {
         popped_coroutine = false;
 
+        // Optimistic increment: prevents wait_idle from seeing an empty
+        // queue with active_tasks_==0 between pop and mark_started.
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ++active_tasks_;
+        }
+
+        bool success = false;
+
         if (coroutine_burst >= coroutine_burst_limit_ && task_queue_.pop(task)) {
-            mark_started();
-            return true;
-        }
-
-        if (worker_has_coroutine(worker_id) && coroutine_queues_[worker_id]->pop(task)) {
+            success = true;
+        } else if (worker_has_coroutine(worker_id) && coroutine_queues_[worker_id]->pop(task)) {
             popped_coroutine = true;
-            mark_started();
-            return true;
+            success = true;
+        } else if (task_queue_.pop(task)) {
+            success = true;
+        } else {
+            popped_coroutine = steal_coroutine(worker_id, task);
+            success = popped_coroutine;
         }
 
-        if (task_queue_.pop(task)) {
-            mark_started();
-            return true;
+        if (!success) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            --active_tasks_;
         }
-
-        popped_coroutine = steal_coroutine(worker_id, task);
-        if (popped_coroutine) {
-            mark_started();
-            return true;
-        }
-        return false;
+        return success;
     }
 
     void mark_started()
