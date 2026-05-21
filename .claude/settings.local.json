@@ -56,7 +56,12 @@
       "Bash(D:/msys64/mingw64/bin/cmake.exe --build e:/Projects/Threadpool/build --config Release --parallel)",
       "Bash(cmake -S e:/Projects/Threadpool -B e:/Projects/Threadpool/build -DCMAKE_BUILD_TYPE=Release)",
       "Bash(cmd.exe /c \"cmake -S e:\\\\Projects\\\\Threadpool -B e:\\\\Projects\\\\Threadpool\\\\build -DCMAKE_BUILD_TYPE=Release\")",
-      "Bash(pwsh.exe -NoProfile -Command \"cmake -S e:\\\\Projects\\\\Threadpool -B e:\\\\Projects\\\\Threadpool\\\\build -DCMAKE_BUILD_TYPE=Release\")"
+      "Bash(pwsh.exe -NoProfile -Command \"cmake -S e:\\\\Projects\\\\Threadpool -B e:\\\\Projects\\\\Threadpool\\\\build -DCMAKE_BUILD_TYPE=Release\")",
+      "Bash(ctest --test-dir build --build-config Release --output-on-failure)",
+      "Bash(./build/threadpool_tests.exe)",
+      "Bash(./build/threadpool_coroutine_tests.exe)",
+      "Bash(./build/threadpool_stress.exe 50000 8 8)",
+      "Bash(./build/threadpool_long_run.exe 5 2)"
     ],
     "additionalDirectories": [
       "e:\\Projects\\Threadpool\\include"

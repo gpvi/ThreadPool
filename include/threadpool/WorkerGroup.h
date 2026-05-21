@@ -68,6 +68,20 @@ public:
         return live_workers() > min_workers_;
     }
 
+    bool try_retire()
+    {
+        while (true) {
+            auto current = live_workers_.load(std::memory_order_relaxed);
+            if (current <= min_workers_) {
+                return false;
+            }
+            if (live_workers_.compare_exchange_weak(
+                    current, current - 1, std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+    }
+
     void decrease_live_worker()
     {
         live_workers_.fetch_sub(1, std::memory_order_relaxed);
@@ -77,7 +91,6 @@ public:
     {
         const auto self_id = std::this_thread::get_id();
         std::unique_lock<std::mutex> lock(mutex_);
-        decrease_live_worker();
         for (std::size_t i = 0; i < workers_.size(); ++i) {
             if (workers_[i].get_id() == self_id) {
                 retired_indices_.push_back(i);

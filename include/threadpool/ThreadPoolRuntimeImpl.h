@@ -163,13 +163,16 @@ inline ThreadPoolRuntime::WorkerWork ThreadPoolRuntime::wait_for_work(
            true);
 
     if (!awakened) {
-        retire_current_worker();
-        scheduler_.notify_idle_if_needed();
-        work.exit = true;
+        if (workers_.try_retire()) {
+            retire_current_worker();
+            scheduler_.notify_idle_if_needed();
+            work.exit = true;
+        }
         return work;
     }
 
     if (shutdown_ && !scheduler_.has_any_work_for_worker(worker_id)) {
+        workers_.decrease_live_worker();
         retire_current_worker();
         scheduler_.notify_idle_if_needed();
         work.exit = true;

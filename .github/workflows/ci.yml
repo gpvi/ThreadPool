@@ -55,7 +55,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build --build-config Debug --output-on-failure
         env:
-          TSAN_OPTIONS: second_deadlock_stack=1 suppressions=tsan_suppressions.txt
+          TSAN_OPTIONS: second_deadlock_stack=1 suppressions=${{ github.workspace }}/tsan_suppressions.txt
 
   asan-ubsan:
     name: ASan + UBSan
@@ -97,8 +97,8 @@ jobs:
       - name: Test under valgrind
         run: |
           valgrind --leak-check=full --error-exitcode=1 \
-            --suppressions=valgrind_suppressions.txt \
+            --suppressions=${{ github.workspace }}/valgrind_suppressions.txt \
             ./build/threadpool_tests
           valgrind --leak-check=full --error-exitcode=1 \
-            --suppressions=valgrind_suppressions.txt \
+            --suppressions=${{ github.workspace }}/valgrind_suppressions.txt \
             ./build/threadpool_stress 5000 4 4
