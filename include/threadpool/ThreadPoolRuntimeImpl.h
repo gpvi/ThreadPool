@@ -186,10 +186,6 @@ inline ThreadPoolRuntime::WorkerWork ThreadPoolRuntime::wait_for_work(
         work.task
     );
 
-    if (work.has_task) {
-        scheduler_.mark_started();
-    }
-
     return work;
 }
 

@@ -161,20 +161,27 @@ public:
         popped_coroutine = false;
 
         if (coroutine_burst >= coroutine_burst_limit_ && task_queue_.pop(task)) {
+            mark_started();
             return true;
         }
 
         if (worker_has_coroutine(worker_id) && coroutine_queues_[worker_id]->pop(task)) {
             popped_coroutine = true;
+            mark_started();
             return true;
         }
 
         if (task_queue_.pop(task)) {
+            mark_started();
             return true;
         }
 
         popped_coroutine = steal_coroutine(worker_id, task);
-        return popped_coroutine;
+        if (popped_coroutine) {
+            mark_started();
+            return true;
+        }
+        return false;
     }
 
     void mark_started()
