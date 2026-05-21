@@ -224,14 +224,12 @@ queued_tasks == 0 && queued_coroutines == 0 && active_tasks == 0
 当前支持基础的动态调整：
 
 - **扩容触发**：`submit_task()` 中检查 `queued_tasks > live_workers` 且 `live_workers < max_workers`，自动创建新 worker
-- **缩容触发**：worker 空闲超时（默认 30s）后，若 `live_workers > min_workers`，该 worker 主动退出
-- **线程回收**：退出的 worker 记录自己的 `thread::id`，下一次 `spawn()` 时由 `reap_retired_workers()` 执行 join 和 erase
+- **缩容触发**：worker 空闲超时（默认 5s）后，通过 `try_retire()` 的 CAS 循环原子检查 `live_workers > min_workers` 并递减计数。CAS 保证了多个 worker 同时超时时不会突破 min 下限
+- **min worker 不超时**：处于 min_workers 层的 worker 使用 `wait()` 无限阻塞，不会被 idle_timeout 反复唤醒
+- **线程回收**：退出的 worker 记录自己在 `workers_` 中的索引（从 `thread::id` 改为索引追踪，避免 OS 复用 ID 引发误回收）。下一次 `spawn()` 时降序排序后从后往前 join + erase
+- **关闭方式**：`shutdown()`（无限等待）→ `shutdown_for(timeout)`（超时 detach）→ `shutdown_until(deadline)`。超时机制使用 helper 线程 join，主线程 deadline 轮询
 
-**为什么不是退出的 worker 自己 join 自己？**
-
-线程不能 join 自己——尝试这样做会死锁。必须由其他线程来 join 退出线程。`WorkerGroup` 的设计是：每次创建新线程前先"收割"已退休的线程对象，在 `shutdown()` 时通过 `join_all()` 做最终清理。
-
-**异常安全**：`WorkerGroup::spawn()` 先创建 `std::thread` 并放入容器，成功后才递增 live worker 计数。如果线程创建失败，计数与实际状态一致。
+**异常安全**：`WorkerGroup::spawn()` 先递增 `live_workers_` 计数，再创建线程。如果 `emplace_back` 抛异常，try-catch 回滚 `fetch_sub(1)` 保持计数正确。先增量后创建的顺序确保新 worker 在进入 `wait_for_work` 时计数已正确。
 
 ## 协程调度设计
 
@@ -356,18 +354,21 @@ static thread_local std::size_t current_worker_id;
 
 ## 可观测性设计
 
-线程池提供三个维度的状态观测：
+线程池提供多维度的状态观测：
 
 | 指标 | 含义 | 实现 |
 |------|------|------|
 | `queued_tasks()` | 全局队列中等待执行的任务 | `SafeQueue::size()` |
 | `queued_coroutines()` | 所有协程队列中等待恢复的协程 | 遍历 sum |
 | `active_tasks()` | worker 已取出、正在执行的任务 | `TaskScheduler::active_tasks_` |
+| `worker_count()` | 当前存活 worker 数 | `atomic<size_t>` relaxed load |
+| `min_workers()` / `max_workers()` | 配置范围 | 构造时记录 |
+| `max_coroutine_queue_size()` | 协程队列上限（0=无限） | 构造时记录 |
+| `is_shutdown()` | 是否已关闭 | runtime_.mutex_ 保护 |
+| `execution_mode()` / `is_coroutine_enabled()` | 运行模式 | 构造时记录 |
+| `on_exception` 回调 | worker 中非 packaged_task 异常 | 构造时注入，worker catch 块调用 |
 
-这三个计数是 `wait_idle` 正确性的基础。`active_tasks` 的维护规则：
-- `mark_started()`：pop 成功后调用（在 runtime 锁内）
-- `mark_finished()`：任务执行完成后调用（在 runtime 锁内）
-- 协程恢复任务也记入 active，保持一致性
+`active_tasks` 采用乐观递增策略：`pop_for_worker` 在尝试取任务前先 `++active`，取失败则回滚。这消除了 `wait_idle` predicate 在"pop 完成但 mark_started 未调用"窗口中的误判。
 
 ## 取舍与限制
 
@@ -379,13 +380,13 @@ static thread_local std::size_t current_worker_id;
 | 全局 FIFO 而非 per-worker 队列 | 实现简单，适合当前规模。多 worker 竞争同一队列在高并发下是瓶颈 |
 | 无抢占式调度 | C++ 无安全强制终止线程的机制。协作式是唯一安全选项 |
 | 协程仅 schedule/yield | 完整 `Task<T>` 需要独立的异步组合框架，超出本项目的范围 |
-| `CancelPending` 破坏 future | 设计上的取舍——清空队列必然破坏 promise。调用方须处理 `future_error` |
+| `CancelPending` 不取消已运行的协程 | 协程帧生命周期绑定到 handle，取消需安全析构帧。运行中的协程继续执行直到 yield/schedule 时检测 shutdown 并退出 |
 
 ### 性能边界
 
 - 全局队列在 worker 数较多（>16）且任务极短时，锁竞争成为瓶颈
-- 极短任务（<1μs）场景下，调度开销可能超过任务本身。这不是线程池最适合的场景
-- benchmark 输出受硬件、系统负载、编译器优化影响，不应作为 CI 通过条件
+- 极短任务（<1μs）场景下，调度开销可能超过任务本身
+- `std::function<void()>` 包装每任务有潜在的堆分配（小函数优化缓冲约 16-32 字节）
 
 ## 测试与验证
 
@@ -393,18 +394,25 @@ static thread_local std::size_t current_worker_id;
 
 | 测试 | 文件 | 目的 | CTest |
 |------|------|------|-------|
-| 行为测试 | `test.cpp` | 验证所有功能接口的正确性 | 是 |
-| 协程测试 | `test_coroutine.cpp` | 验证 schedule/yield、关闭行为 | 是 |
-| 压力测试 | `stress_test.cpp` | 并发提交 + CancelPending + StopToken | 是（5000/4/4） |
-| 基准测试 | `benchmark.cpp` | 观察吞吐和延迟趋势 | 否（结果不稳定） |
-| 模式对比 | `mode_compare.cpp` | 对比 ThreadOnly vs ThreadAndCoroutine | 否 |
+| 行为测试 (13 cases) | `tests/test.cpp` | submit/future、shutdown 语义、StopToken、动态伸缩、wait_idle_until、shutdown_timeout、max_workers 上限 | 是 |
+| 协程测试 (7 cases) | `tests/test_coroutine.cpp` | schedule/yield、work stealing、burst limit、queue limit、shutdown 行为 | 是 |
+| 压力测试 | `tests/stress_test.cpp` | 并发提交 + CancelPending + StopToken | 是（5000/4/4） |
+| 基准测试 | `tests/benchmark.cpp` | 吞吐 + 延迟分位数 + std::async 基线 | 否 |
+| 模式对比 | `tests/mode_compare.cpp` | ThreadOnly vs ThreadAndCoroutine | 否 |
+| 长时压测 | `tests/long_run_stress.cpp` | 持续 submit、create/destroy 循环、协程压力、shutdown 超时 | 否 |
 
 ### CI 覆盖
 
-GitHub Actions 覆盖 `ubuntu-latest` + `windows-latest`，确保：
-- GCC 和 MSVC 均能编译
-- C++14 和 C++20 路径均有效
-- 平台相关差异（`microseconds::rep` 类型等）被早发现
+GitHub Actions 5 个 job 并行：
+
+| Job | 平台 | 检测 |
+|-----|------|------|
+| Release | ubuntu + windows | 编译 + 功能测试 |
+| TSan | ubuntu | 数据竞争（data race） |
+| ASan + UBSan | ubuntu | 内存错误、未定义行为 |
+| Valgrind | ubuntu | 内存泄漏 |
+
+确保 GCC / MSVC 均通过，C++14 / C++20 路径均编译正确。
 
 ## 后续演进方向
 
@@ -412,4 +420,3 @@ GitHub Actions 覆盖 `ubuntu-latest` + `windows-latest`，确保：
 2. **任务优先级**：多优先级队列，紧急任务插队
 3. **完整 `Task<T>` 协程模型**：支持 co_return 值、continuation、exception propagation
 4. **更丰富的可观测性**：任务等待时间分布、per-worker 统计、prometheus 风格 metrics
-5. **CMake 安装导出**：`find_package(ThreadPool)` 支持

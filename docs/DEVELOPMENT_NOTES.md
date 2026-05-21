@@ -645,13 +645,361 @@ shutdown -> join_all 清理所有 thread
 
 弱化简单接口名和过多实现细节。
 
+## 30. `reap_retired_workers` 用 thread::id 匹配线程可能导致误回收
+
+### 问题
+
+代码审查发现 `WorkerGroup` 中 `retire_current_worker()` 通过 `std::this_thread::get_id()` 存储当前线程 ID，`reap_retired_workers()` 通过 `worker.get_id()` 匹配。一旦操作系统复用线程 ID，新创建的 worker 可能被误匹配，导致 join 正在运行的线程。
+
+### 原因
+
+`std::thread::id` 在 POSIX 上是 `pthread_t`，理论上线程退出后 ID 可以被操作系统复用。虽然实际概率极低，但作为线程池的基础设施不能依赖概率。
+
+### 解决策略
+
+将 ID 匹配改为索引追踪：
+
+1. `retire_current_worker()` 在 `mutex_` 保护下遍历 `workers_` 找到自己的索引位置，存入 `retired_indices_`。
+2. `reap_retired_workers()` 对索引降序排序后从 `workers_` 中 `join` + `erase`，避免索引偏移问题。
+3. 用 `std::greater<std::size_t>()` 降序确保从后往前删除，前面索引保持稳定。
+
+## 31. `spawn()` 中 live_workers 递增时序晚于线程启动
+
+### 问题
+
+`spawn()` 流程是 `emplace_back(std::thread(...))` 之后再 `live_workers_.fetch_add(1)`。但 `emplace_back` 在构造 `std::thread` 那一刻新线程就启动了，而 `live_workers_` 此时还是旧值。
+
+### 场景推演
+
+```
+ThreadPool 构造 → start(1) → spawn() 创建 Worker-0
+emplace_back 完成 → Worker-0 线程开始运行
+Worker-0 进入 wait_for_work → should_exit_on_idle() 读到 live_workers_==0
+  → 0 > min_workers(1) → false → 不退出，但逻辑建立在不一致的计数上
+fetch_add(1) 终于执行 → live_workers_==1
+```
+
+更严重场景：shutdown 链路中，`join_all()` swap 走 workers 并 join，但此时 `live_workers_` 可能因尚未执行的 `fetch_add` 而泄漏一个永远不回收的计数。
+
+### 解决策略
+
+将 `live_workers_.fetch_add(1)` 移动到 `emplace_back` 之前：
+
+```cpp
+live_workers_.fetch_add(1, relaxed);
+try {
+    lock(mutex_);
+    workers_.emplace_back(ThreadPoolWorker(runtime, worker_id));
+} catch (...) {
+    live_workers_.fetch_sub(1, relaxed);  // 回滚
+    throw;
+}
+```
+
+关键点：`emplace_back` 可能抛异常（线程创建失败），必须用 try-catch 回滚计数。
+
+## 32. `retire_current_worker()` 中计数更新在锁外
+
+### 问题
+
+`decrease_live_worker()`（原子 fetch_sub）在 `WorkerGroup::mutex_` 之外执行。并发 `spawn()` → `reap_retired_workers()` 在 `decrease` 之后、索引记录之前执行时，会错过该 retired worker 的 join 时机。
+
+### 解决策略
+
+将 `decrease_live_worker()` 移入 `mutex_` 内。这样计数减少与索引记录在同一临界区，`reap_retired_workers()` 不会漏掉。
+
+## 33. 多个 worker 可同时退休突破 min_workers 下限
+
+### 问题
+
+`should_exit_on_idle()` 检查 `live_workers() > min_workers_`，然后单独调用 `decrease_live_worker()`。两者不是原子操作。三个 worker 同时超时，可能全部读到 `3 > 1 = true`，全部退休，导致 `live_workers_` 归零。
+
+### 根本原因
+
+检查条件（read）和状态变更（write）之间存在 TOCTOU 窗口。标准条件变量 wait_for 超时后不保证只有一个线程看到超时——所有 worker 可以同时被唤醒并同时检查条件。
+
+### 解决策略
+
+引入 CAS 循环 `try_retire()`：
+
+```cpp
+bool try_retire() {
+    while (true) {
+        auto current = live_workers_.load(relaxed);
+        if (current <= min_workers_) return false;   // 不能退
+        if (live_workers_.compare_exchange_weak(current, current - 1, relaxed))
+            return true;  // 原子减 1
+    }
+}
+```
+
+Idle timeout 路径改用 `try_retire()`，shutdown 路径保持无条件 `decrease_live_worker()`（shutdown 时所有 worker 必须退出）。
+
+## 34. `wait_idle` 与 pop/mark_started 之间的 TOCTOU 竞态
+
+### 问题
+
+`wait_idle` 的 predicate（`task_queue_.empty() && active_tasks_ == 0`）和 worker 的 pop+mark_started 操作之间存在竞态：
+
+```
+Worker: pop_for_worker → task_queue.pop() → 队列变空
+Main:   wait_idle 检查 predicate → empty=true, active=0 → 误判空闲
+Worker: mark_started → active++（太晚了）
+```
+
+ASan 构建下 worker 线程变慢，这个窗口被放大，`test_wait_idle_for_times_out_and_then_succeeds` 在 CI 上稳定失败。
+
+### 尝试 1：把 mark_started 移入 pop_for_worker
+
+第一次修复把 `mark_started()` 移入 `pop_for_worker` 的每个成功返回路径。但这没解决问题——`pop` 释放 SafeQueue 锁后、`mark_started` 获取 `scheduler_.mutex_` 前，`wait_idle` 仍能在这个缝隙中观察到不一致状态。
+
+### 最终方案：乐观 active_tasks 递增
+
+在 `pop_for_worker` 的最开始，**先**在 `scheduler_.mutex_` 锁内 `++active_tasks_`，然后再尝试 pop。如果 pop 失败（无任务可取），回滚递减。
+
+```
+pop_for_worker:
+  lock(scheduler_.mutex_)
+  ++active_tasks_              ← 先记账，wait_idle 已经看不到 0
+  unlock(scheduler_.mutex_)
+
+  尝试 pop ... （无论成败，active_tasks 已经 > 0）
+
+  if 失败:
+    lock(scheduler_.mutex_)
+    --active_tasks_            ← 回滚
+    return false
+```
+
+关键洞察：`wait_idle` 的 predicate 同锁（`scheduler_.mutex_`）读取 `active_tasks_`，所以乐观递增后的值对 predicate 立即可见。pop 尝试过程中的队列变空不会导致误判，因为 active 计数已经为正。
+
+## 35. `active_tasks()` 存在双重加锁
+
+### 问题
+
+`ThreadPoolRuntimeImpl::active_tasks()` 外层获取 `runtime_.mutex_`，然后调用 `scheduler_.active_tasks()` 内层获取 `scheduler_.mutex_`。两把锁没有冲突，但有一把是多余的——每次获取/释放锁都有开销。
+
+### 解决策略
+
+移除 `ThreadPoolRuntime` 中的外层锁，直接委托给 `TaskScheduler::active_tasks()`（它自带锁）。
+
+## 36. `call_impl` 冗余声明 / `#include` 膨胀
+
+### 问题
+
+`call_impl` 是 C++14 下替代 `std::apply` 的静态成员函数模板。它在 `ThreadPool.h` 的 class 内声明，在 `ThreadPoolSubmit.h` 中定义。对于 header-only 库，这种声明-定义分离没有意义——声明唯一的目的是让定义在 class 外的模板能通过编译。
+
+### 解决策略
+
+将 `call_impl` 从静态成员函数改为 `detail::apply_impl` 自由函数。不再需要在 class 内声明。
+
+连带优化：`ThreadPool.h` 原先为子头文件预导入 12 个标准库头文件（`<atomic>`、`<condition_variable>`、`<functional>` 等不在 facade 层直接使用的）。每个子头文件补齐各自的 `#include` 后，主头文件从 12 个缩减到 4 个（`<chrono>`、`<cstddef>`、`<future>`、`<stdexcept>`）。
+
+## 37. `prefer_current_worker && current_runtime() == this` 被重复求值
+
+### 问题
+
+`enqueue_coroutine_resume` 中判断"是否偏好当前 worker"的复合条件 `prefer_current_worker && current_runtime() == this` 被计算了两次：一次选 target，一次传给 `push_coroutine`。`current_runtime()` 读 thread_local 不是纯函数——如果有协程在不同 worker 间迁移，第二次求值可能不同。
+
+### 解决策略
+
+计算一次存入 `const bool is_current`，后续两处引用同一值。
+
+## 38. 协程队列容量不可查询
+
+### 问题
+
+`max_coroutine_queue_size` 的验证在 `TaskScheduler` 内部，异常直接抛给 `co_await` 处。调用方无法提前知道限制，也无法查询当前配置。
+
+### 解决策略
+
+三层贯通：`TaskScheduler::max_coroutine_queue_size()` → `ThreadPoolRuntime` → `ThreadPool` facade。调用方可以在提交协程前检查。
+
+## 39. shutdown 可能永久阻塞
+
+### 问题
+
+`shutdown()` 调 `join_all()` 逐个 join worker 线程。如果某个 worker 正执行死循环或阻塞 IO，join 永不返回 → 进程无法退出。
+
+### 解决策略
+
+新增 `shutdown_for(timeout)` / `shutdown_until(deadline)`：
+
+实现方式：单独启动一个 helper 线程 join 所有 worker，主线程以 deadline 轮询。超时则 `detach` 剩余 worker 和 helper，返回 `false`。
+
+```
+shutdown_for(5s):
+  1. 设置 shutdown_ = true，通知所有 worker
+  2. helper 线程 join 所有 worker
+  3. 主线程以 1ms 粒度检查 helper 是否完成
+  4. 超时 → detach helper + 剩余 worker → return false
+  5. 完成 → join helper → return true
+```
+
+> **语义约定**：`shutdown_for` 返回 false 后，detach 的 worker 会继续执行到任务完成。已排队的全局任务在 CancelPending 模式下被丢弃。池对象仍可安全析构。
+
+## 40. 非 packaged_task 任务的异常静默丢失
+
+### 问题
+
+worker 循环中 `catch(...)` 吞掉所有异常。`submit()` 创建的 `packaged_task` 会把异常保存到 future，但协程 recover 的 `schedule()`/`yield()` lambda 抛异常只能静默丢失。
+
+### 解决策略
+
+在 `ThreadPoolOptions` 中增加 `on_exception` 回调：
+
+```cpp
+std::function<void(const std::exception_ptr &)> on_exception;
+```
+
+worker 捕获异常后，先调用此回调再丢弃。用户可以在回调中记录日志、发告警。默认 `nullptr`（保持原有行为）。
+
+## 41. min_worker 空闲时每 idle_timeout 伪唤醒
+
+### 问题
+
+所有 worker 统一用 `wait_for(timeout)` 等待工作。处于 min_workers 层的 worker 即便永远不会退出（`should_exit_on_idle() == false`），也会每 5 秒被 timeout 唤醒做无用检查。
+
+### 解决策略
+
+`wait_for_work` 中根据 `should_exit_on_idle()` 选择等待方式：
+
+- 可退出的 excess worker → `wait_for(timeout)`，超时后尝试退休
+- 保底的 min worker → `wait()`，永久阻塞直到有工作或 shutdown
+
+## 42. 全局 `using ThreadPool` 污染命名空间
+
+### 问题
+
+`ThreadPool.h` 底部无条件注入全局命名空间：`using ThreadPool = threadpool::ThreadPool;`。任何包含此头文件的编译单元都被迫接受全局 `ThreadPool` 别名。如果其他库也定义了同名符号，构成 ODR 违规。
+
+### 解决策略
+
+改为 opt-in 宏：
+
+```cpp
+#ifdef THREADPOOL_USE_GLOBAL_NAMESPACE
+using ThreadPool = threadpool::ThreadPool;
+#endif
+```
+
+## 43. CMake install 规则缺失
+
+### 问题
+
+项目只有 `add_executable` 和 `add_library`，没有 `install()` 规则。用户只能 copy-paste 头文件，无法用 `find_package` 集成。
+
+### 解决策略
+
+增加 CMake install 规则 + 生成器表达式区分构建和安装路径：
+
+```cmake
+target_include_directories(threadpool INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+install(TARGETS threadpool EXPORT threadpool-targets)
+install(DIRECTORY include/ DESTINATION include)
+install(EXPORT threadpool-targets DESTINATION lib/cmake/threadpool)
+```
+
+首次提交时 `INSTALL_INTERFACE` 导致 CMake 报错"path prefixed in source directory"——`include/` 的相对路径被 CMake 解释为源码树内路径。修正为生成器表达式写法后解决。
+
+## 44. CI 缺少 sanitizer 门禁
+
+### 问题
+
+CI 只有 Release 构建 + 功能测试。线程池库的核心风险（data race、use-after-free、内存泄漏）没有自动化检测。
+
+### 解决策略
+
+增加三个 CI job，与原有构建并行运行：
+
+- **TSan**：`-fsanitize=thread`，检测 data race
+- **ASan + UBSan**：`-fsanitize=address,undefined`，检测内存错误和未定义行为
+- **Valgrind memcheck**：`--leak-check=full --error-exitcode=1`，检测内存泄漏
+
+## 45. TSan 报告 GCC `shared_ptr` 伪阳性
+
+### 问题
+
+TSan job 报告 `shared_ptr_base.h:1070` 数据竞争。这是 GCC libstdc++ 的 `std::shared_ptr` 内部引用计数使用了 `__atomic` 内建函数，TSan 无法正确截获，产生误报。
+
+### 解决策略
+
+添加 `tsan_suppressions.txt`，抑制 `std::__shared_count` 和 `std::_Sp_counted_base` 的伪阳性。CI 通过 `TSAN_OPTIONS=suppressions=...` 引用。
+
+首次 CI 运行时 suppression 文件路径写为相对路径（`suppressions=tsan_suppressions.txt`），但 CTest 默认以 build 目录为 CWD，找不到源码树根的文件。改为 `${{ github.workspace }}/tsan_suppressions.txt` 绝对路径。
+
+## 46. ASan 检测到 test 中的 heap-use-after-free
+
+### 问题
+
+协程队列限制测试中，`std::promise<void> blocker` 在 `ThreadPool pool` 之后声明，C++ 以声明逆序析构——`blocker` 先于 `pool` 销毁。`blocker` 析构释放 shared state 时，worker 线程可能仍在 `block_future.get()` 中访问。
+
+### 解决策略
+
+将 `blocker` / `block_future` 声明移到 `pool` 之前。析构顺序变为 `pool` 先（join 所有 worker），再 `blocker`（此时 worker 已安全退出）。
+
+## 47. Valgrind 下动态伸缩测试超时
+
+### 问题
+
+`test_dynamic_workers_can_retire_and_grow_again` 用 `idle_timeout=50ms`，sleep 120ms 给 worker 退休时间。Valgrind 下（10-30x 减速）时间不够，worker 还未退休断言已失败。
+
+### 解决策略
+
+增大 `idle_timeout` 到 500ms，sleep 到 1000ms。同时添加 `valgrind_suppressions.txt` 抑制 pthread TLS 的已知 `possibly lost` 分配（线程局部存储，进程退出时由 OS 回收）。
+
+## 48. 长时运行稳定性没有覆盖
+
+### 问题
+
+CTest 只跑数秒内的功能测试。没有持续运行、反复创建销毁池、混合 submit+yield 的长时验证。
+
+### 解决策略
+
+新增 `long_run_stress.cpp`：可配置时长，持续运行 submit / create-destroy cycle / coroutine yield 以及 shutdown 超时验证。不加入 CTest（时长太长），保留为手动运行工具。
+
+## 49. Benchmark 缺少竞品基线对比
+
+### 问题
+
+benchmark 只测量自身数据，没有参照物。看吞吐数字无法判断好坏。
+
+### 解决策略
+
+增加 `std::async` 基线：
+
+```cpp
+void benchmark_std_async(size_t tasks) {
+    // 用 std::async(std::launch::async, ...) 提交相同任务
+    // 对比 thread pool 的调度开销
+}
+```
+
+`std::async` 每任务创建一个线程（或从全局线程池分配），其吞吐数字可作为"无调度层开销"的参照。
+
+## 50. `threadpool_stress` 拼写错误保留
+
+### 问题
+
+stress test 目标名自早期代码以来一直拼作 `threadpool_stress`（少了一个 t）。更名会破坏已有 CI 脚本和用户肌肉记忆。
+
+### 解决策略
+
+保留现状。所有引用（CMake target、CTest、二进制文件名、文档）保持一致使用 `stress`。不修正。
+
+---
+
 ## 总结
 
-本项目开发过程中，主要问题集中在四类：
+本项目的开发问题集中在五类：
 
-1. 并发正确性：关闭语义、条件变量、数据竞争、任务遗留。
-2. 可用性：自动启动、自动关闭、状态观测、取消机制。
-3. 跨平台：C++ 标准差异、标准库类型差异、CI 平台差异。
-4. 工程化：CMake、CTest、benchmark、文档分层、Git 忽略规则。
+1. **并发正确性**：条件变量语义、TOCTOU 竞态（pop/mark_started、idle 超时、多 worker 退休）、原子操作与锁的粒度配合、引用计数伪阳性。
+2. **资源生命周期**：线程启停时序（spawn/retire 计数一致性）、shutdown 超时、异常处理链路、协程帧析构。
+3. **可用性**：shutdown 永不阻塞、异常可追踪、空闲省电、容量可查询。
+4. **工程化**：CMake install、sanitizer CI（TSan + ASan + UBSan + Valgrind）、benchmark 基线、vcpkg 打包。
+5. **跨平台与稳健性**：GCC `shared_ptr` TSan 伪阳性、Valgrind 减速导致测试超时、pthread TLS 静态泄漏。
 
-这些问题的解决过程让项目从一个简单线程池示例，逐步演进为一个具备测试、文档、CI 和基础性能观测能力的小型并发组件。
+这些问题的解决过程让项目从"能工作的线程池"演进为"有门禁的正式产品"——每一个修复背后都是生产环境中会遇到的真问题。
