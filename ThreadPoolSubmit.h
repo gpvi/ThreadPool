@@ -3,14 +3,11 @@
 namespace threadpool {
 
 template <typename F, typename... Args>
-auto ThreadPool::submit(F &&f, Args &&...args)
-    -> std::future<detail::invoke_result_t<F, Args...>>
+auto ThreadPool::submit(F &&f, Args &&...args) -> std::future<detail::invoke_result_t<F, Args...>>
 {
     using ReturnType = detail::invoke_result_t<F, Args...>;
-
     auto packaged = std::make_shared<std::packaged_task<ReturnType()>>(
-        [func = std::forward<F>(f),
-         tuple_args = std::make_tuple(std::forward<Args>(args)...)]() mutable -> ReturnType {
+        [func = std::forward<F>(f), tuple_args = std::make_tuple(std::forward<Args>(args)...)]() mutable -> ReturnType {
 #if (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L
             return std::apply(std::move(func), std::move(tuple_args));
 #else

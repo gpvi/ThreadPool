@@ -1,432 +1,167 @@
 # ThreadPool
 
-一个 C++ 轻量级线程池项目，实现线程池、任务调度、异步结果返回、协作式取消、C++20 协程调度，以及基础压力测试和 benchmark。
+header-only C++ 线程池库。C++14 基线，C++20 协程条件启用，跨 Windows / Linux（GCC + MSVC）。
 
-相关文档：
+## 能干什么
 
-- [docs/DESIGN.md](docs/DESIGN.md)：详细设计说明。
-- [docs/DEVELOPMENT_NOTES.md](docs/DEVELOPMENT_NOTES.md)：开发问题集合与解决策略。
-
-## 核心能力
-
-- 固定数量 worker 线程，复用线程资源，减少频繁创建线程的开销。
-- 基于线程安全 FIFO 队列和条件变量完成任务调度、阻塞等待和唤醒。
-- 支持运行模式切换：纯线程模式、线程 + 协程模式。
-- 在线程 + 协程模式下，每个 worker 维护自己的协程队列。
-- 支持普通函数、lambda、成员函数等任务形式。
-- 使用 `std::packaged_task` 和 `std::future` 支持异步返回值和异常传播。
-- 支持自动启动、析构自动关闭、优雅排空和取消排队任务。
-- 支持等待线程池空闲、查询排队任务数和活跃任务数。
-- 支持 `StopSource` / `StopToken` 协作式取消。
-- 在 C++20 下支持 `co_await pool.schedule()` 和 `co_await pool.yield()`，让协程切换到线程池 worker 并主动让出执行权。
-- 提供单元测试、协程测试、压力测试和 benchmark。
-
-## 项目结构
-
-```text
-.
-├── CMakeLists.txt        # CMake 构建入口
-├── SafeQueue.h           # 线程安全任务队列
-├── TaskScheduler.h       # 普通任务、协程队列、work stealing、空闲等待
-├── ThreadPool.h          # 对外主入口和线程池 facade
-├── ThreadPoolRuntime.h   # 运行时协调层，管理关闭状态和 worker 唤醒
-├── ThreadPoolRuntimeImpl.h# 运行时 inline 实现
-├── ThreadPoolImpl.h      # ThreadPool facade 的少量 inline 实现
-├── ThreadPoolSubmit.h    # submit / submit_with_stop 模板实现
-├── ThreadPoolWorker.h    # ThreadPoolWorker 类型、worker 循环和任务执行逻辑
-├── WorkerGroup.h         # worker 生命周期、扩缩容、join 管理
-├── WorkerGroupImpl.h     # WorkerGroup 创建 ThreadPoolWorker 的 inline 实现
-├── ThreadPoolOptions.h   # 运行模式和启动参数
-├── ThreadPoolStopToken.h # 协作式取消 token/source
-├── ThreadPoolTypeTraits.h# C++14/C++20 类型萃取兼容层
-├── main.cpp              # 基础示例
-├── test.cpp              # C++14 行为测试
-├── test_coroutine.cpp    # C++20 协程调度测试
-├── stress_test.cpp       # 压力测试
-├── benchmark.cpp         # 基准测试
-├── mode_compare.cpp      # 纯线程 / 线程+协程模式对比
-└── docs/
-    └── DESIGN.md         # 详细设计说明
-```
-
-## 架构分层
-
-当前实现按职责拆成四层：
-
-- `ThreadPool`：对外 facade，保持使用方式简单。
-- `ThreadPoolRuntime`：运行时协调层，负责启动、关闭、worker 唤醒和跨层调用。
-- `TaskScheduler`：调度层，负责普通任务队列、worker 本地协程队列、work stealing、active 计数和 idle 等待。
-- `WorkerGroup` / `ThreadPoolWorker`：执行层，负责线程生命周期和 worker 循环。
-
-锁策略采用“谁拥有数据，谁管理锁”：队列由 `SafeQueue` 自己加锁，调度状态由 `TaskScheduler` 加锁，线程容器由 `WorkerGroup` 加锁，运行时只保护启动/关闭状态和唤醒条件。
-
-## 快速开始
-
-推荐使用 CMake：
-
-```powershell
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-CTest 默认运行：
-
-- `threadpool_tests`
-- `threadpool_coroutine_tests`
-- `threadpool_stress`
-
-benchmark 不加入默认 CTest，因为性能结果容易受机器配置、系统负载和编译器影响。
-
-## 基本用法
-
-默认构造是纯线程模式，适合普通任务提交：
+### 1. 提交任务，拿到 future 返回值
 
 ```cpp
 #include "ThreadPool.h"
-
 #include <iostream>
 
-int main()
-{
-	threadpool::ThreadPool pool(4);
+int main() {
+    ThreadPool pool(4);                            // 4 个 worker 线程
 
-	auto result = pool.submit([] {
-		return 42;
-	});
+    auto f = pool.submit([]{ return 42; });        // 提交任务
+    std::cout << f.get() << std::endl;             // 拿到返回值 42
 
-	std::cout << result.get() << std::endl;
-	return 0;
+    // pool 析构自动 shutdown
 }
 ```
 
-`submit()` 返回 `std::future<T>`：
-
-- 任务完成后，`future.get()` 返回结果。
-- 任务抛异常时，异常会在 `future.get()` 中重新抛出。
-- 任务没有返回值时，返回 `std::future<void>`。
-
-也可以使用参数对象显式配置线程池：
+### 2. 支持各种任务形式
 
 ```cpp
-threadpool::ThreadPool::Options options;
-options.min_workers = 4;
-options.max_workers = 4;
-options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadOnly;
+// 普通函数
+auto f1 = pool.submit(add, 1, 2);
 
-threadpool::ThreadPool pool(options);
-```
+// lambda
+auto f2 = pool.submit([](int x) { return x * 2; }, 21);
 
-## 任务提交
-
-普通函数：
-
-```cpp
-int add(int a, int b)
-{
-	return a + b;
-}
-
-auto result = pool.submit(add, 1, 2);
-```
-
-lambda：
-
-```cpp
-auto result = pool.submit([](int a, int b) {
-	return a * b;
-}, 5, 6);
-```
-
-引用参数需要使用 `std::ref`：
-
-```cpp
-void write_result(int &out)
-{
-	out = 100;
-}
-
-int value = 0;
-auto done = pool.submit(write_result, std::ref(value));
-done.get();
-```
-
-成员函数：
-
-```cpp
-class Calculator {
-public:
-	int multiply(int a, int b)
-	{
-		return a * b;
-	}
-};
-
+// 成员函数
 Calculator calc;
-auto result = pool.submit(&Calculator::multiply, &calc, 3, 4);
+auto f3 = pool.submit(&Calculator::multiply, &calc, 3, 4);
+
+// 引用参数用 std::ref
+int value = 0;
+pool.submit([](int &out) { out = 100; }, std::ref(value)).get();
 ```
 
-## 关闭策略
-
-默认关闭策略会等待已提交任务执行完成：
+### 3. 两种关闭方式
 
 ```cpp
-pool.shutdown();
+pool.shutdown();                                       // Drain：等已提交任务跑完
+pool.shutdown(ThreadPool::ShutdownMode::CancelPending); // 立即清空排队任务
 ```
 
-如果希望丢弃尚未开始执行的排队任务：
+析构函数会自动 shutdown，不怕忘。
+
+### 4. 查看线程池状态
 
 ```cpp
-pool.shutdown(threadpool::ThreadPool::ShutdownMode::CancelPending);
+pool.wait_idle();                    // 阻塞等到所有任务完成
+pool.queued_tasks();                 // 还在排队的任务数
+pool.active_tasks();                 // 正在执行的任务数
+pool.queued_coroutines();            // 等待恢复的协程数
+pool.worker_count();                 // 存活 worker 数
+pool.is_shutdown();                  // 是否已关闭
 ```
 
-两种模式的区别：
-
-- `Drain`：停止接收新任务，但执行完已提交任务。
-- `CancelPending`：停止接收新任务，并丢弃尚未被 worker 取走的排队任务；这些任务对应的 `future.get()` 会抛出 `std::future_error`。
-
-析构函数会自动调用关闭流程，避免忘记释放 worker 线程。
-
-## 状态观测
+### 5. 协作式取消
 
 ```cpp
-pool.wait_idle();
-pool.wait_idle_for(std::chrono::seconds(1));
-pool.wait_idle_until(deadline);
+ThreadPool::StopSource source;
 
-pool.worker_count();
-pool.queued_tasks();
-pool.queued_coroutines();
-pool.active_tasks();
-pool.is_shutdown();
+auto future = pool.submit_with_stop(source.token(), [](ThreadPool::StopToken token) {
+    while (!token.stop_requested()) {
+        do_work_chunk();             // 小粒度工作单元，每次循环检查取消
+    }
+    return "stopped";
+});
+
+source.request_stop();               // 通知所有持有此 token 的任务
+future.get();                        // → "stopped"
 ```
 
-这些接口主要用于测试、批处理阶段同步和退出前收尾。
-
-## 协作式取消
-
-线程池不能安全地强制终止正在运行的 C++ 线程。项目使用协作式取消：由任务主动检查取消信号并安全退出。
+### 6. C++20 协程调度
 
 ```cpp
-threadpool::ThreadPool::StopSource stop_source;
+// 构造时显式启用
+ThreadPool pool(4, ThreadPool::ExecutionMode::ThreadAndCoroutine);
 
-auto result = pool.submit_with_stop(
-	stop_source.token(),
-	[](threadpool::ThreadPool::StopToken token) {
-		while (!token.stop_requested()) {
-			do_some_work_chunk();
-		}
-		return "stopped";
-	}
-);
-
-stop_source.request_stop();
-```
-
-`CancelPending` 负责取消还没开始执行的任务；`StopToken` 负责通知已经开始执行的任务自行退出。
-
-## 协程调度
-
-默认模式是纯线程模式。如果需要协程调度，需要在创建线程池时显式启用：
-
-```cpp
-threadpool::ThreadPool pool(
-	4,
-	threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine
-);
-```
-
-也可以通过参数对象启用：
-
-```cpp
-threadpool::ThreadPool::Options options;
-options.min_workers = 4;
-options.max_workers = 4;
-options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine;
-
-threadpool::ThreadPool pool(options);
-```
-
-启用后，在支持 C++20 coroutine 的编译器下可以使用：
-
-```cpp
+// 把协程切换到线程池 worker 上执行
 co_await pool.schedule();
-```
 
-含义是：当前协程挂起，并把协程恢复动作提交到线程池；worker 线程执行恢复动作后，协程从 `co_await` 后继续运行。
-
-```cpp
-CoroutineTask work(threadpool::ThreadPool &pool)
-{
-	co_await pool.schedule();
-
-	// 从这里开始运行在线程池 worker 线程中
-	do_heavy_work();
-}
-```
-
-当前协程支持是轻量调度入口，不是完整的 `Task<T>` 协程框架。
-
-如果协程已经运行在线程池 worker 上，可以使用：
-
-```cpp
+// 主动让出 worker，稍后恢复
 co_await pool.yield();
 ```
 
-它会让当前协程挂起，并把恢复动作重新放回线程池队列。这样一个 worker 线程可以在多个协程之间协作式轮转：
+完整协程示例：
 
 ```cpp
-CoroutineTask work(threadpool::ThreadPool &pool)
-{
-	co_await pool.schedule();
-	step1();
-
-	co_await pool.yield();
-	step2();
-
-	co_await pool.yield();
-	step3();
+CoroutineTask work(ThreadPool &pool, std::vector<int> &steps, int id) {
+    co_await pool.schedule();        // 切换到 worker
+    steps.push_back(id * 10);
+    co_await pool.yield();           // 让出
+    steps.push_back(id * 10 + 1);
+    co_await pool.yield();           // 再让出
+    steps.push_back(id * 10 + 2);
 }
+// 一个 worker 线程可以在多个协程之间协作式轮转
 ```
 
-注意：`yield()` 是协作式让出。协程只有主动 `co_await pool.yield()`，其他协程才有机会更快获得 worker 执行权。
+### 7. 动态扩缩容
 
-如果在纯线程模式下调用 `schedule()` 或 `yield()`，会抛出 `std::runtime_error`。
+```cpp
+ThreadPool::Options options;
+options.min_workers = 2;   // 最少保留 2 个 worker
+options.max_workers = 8;   // 最多扩容到 8 个
+options.idle_timeout = std::chrono::seconds(10);  // 空闲 10s 后缩容
 
-当前协程调度策略：
-
-- 普通任务进入全局任务队列。
-- `schedule()` 将协程恢复动作按轮询策略放入某个 worker 的本地协程队列。
-- `yield()` 优先将当前协程重新放回当前 worker 的本地协程队列。
-- worker 优先执行自己的协程队列，但会通过连续协程执行配额避免普通任务长期饥饿。
-- worker 本地协程队列为空时，可以从其他 worker 的协程队列偷取恢复任务。
-
-## 压力测试
-
-CMake 会构建压力测试目标，也会通过 CTest 运行一组轻量压力测试。
-
-手动运行：
-
-```powershell
-.\threadpool_stress.exe <tasks> <workers> <submitters>
+ThreadPool pool(options);
+// 排队任务 > 存活 worker → 自动扩容
+// worker 空闲超时 → 自动缩容（不低于 min_workers）
 ```
 
-示例：
+---
 
-```powershell
-.\threadpool_stress.exe 50000 8 8
-```
+## 不包括什么
 
-覆盖场景：
+- 任务优先级
+- 抢占式任务终止
+- 完整的 `Task<T>` 协程框架
+- 定时器和 I/O 事件
 
-- 大量任务提交和结果校验。
-- 多提交线程并发提交。
-- 排队任务取消。
-- 协作式取消。
+项目定位是**结构清晰、可测试、可扩展的并发组件**，不是高性能运行时。
 
-## Benchmark
+---
 
-benchmark 用于观察不同 worker 数下的吞吐和简单调度延迟，不作为功能正确性测试。
+## 构建 & 运行
 
-运行：
+### CMake（推荐）
 
-```powershell
-.\threadpool_benchmark.exe <tasks> <submitters>
-```
-
-示例：
-
-```powershell
-.\threadpool_benchmark.exe 100000 4
-```
-
-输出指标：
-
-- `tasks/sec`：每秒完成任务数。
-- `p50_us` / `p95_us` / `p99_us`：任务从提交到开始执行的延迟采样。
-
-对极短任务来说，worker 数量增加不一定提升吞吐，因为共享队列锁和线程调度开销可能超过并行收益。
-
-## 当前验证结果
-
-最近一次本地 Release 验证：
-
-```powershell
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel
 ctest --test-dir build --build-config Release --output-on-failure
-.\threadpool_stress.exe 20000 4 4
-.\threadpool_mode_compare.exe 20000 2000 10 4
-.\threadpool_benchmark.exe
 ```
 
-结果：
+CTest 默认跑 3 项：行为测试 + 协程测试 + 轻量压力测试。
 
-- CTest：3/3 通过，覆盖普通任务、协程调度和轻量压力测试。
-- 压力测试：20000 个 future 任务完成，多提交线程、排队任务取消和协作式取消均通过。
-- 模式对比：纯线程模式约 68965 ops/sec，线程 + 协程模式约 385964 ops/sec。
-- Benchmark 延迟采样：6 worker 下 p50 约 24 us，p95 约 57 us，p99 约 80 us。
+### 手动编译
 
-性能数据只代表当前机器和当前编译配置，不作为跨平台性能承诺。
-
-## 手动编译
-
-不使用 CMake 时，也可以直接用 g++：
-
-```powershell
-g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread main.cpp -o threadpool_check.exe
-g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread test.cpp -o threadpool_tests.exe
-g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test_coroutine.cpp -o threadpool_coroutine_tests.exe
-g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread stress_test.cpp -o threadpool_stress.exe
-g++ -std=gnu++14 -Wall -Wextra -Wpedantic -pthread benchmark.cpp -o threadpool_benchmark.exe
-g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread mode_compare.cpp -o threadpool_mode_compare.exe
+```bash
+g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test.cpp -o threadpool_tests
+g++ -std=gnu++20 -Wall -Wextra -Wpedantic -pthread test_coroutine.cpp -o threadpool_coroutine_tests
 ```
 
-## 模式对比
+### 压力测试 & Benchmark
 
-`mode_compare.cpp` 用于对比纯线程模式和线程 + 协程模式：
-
-```powershell
-.\threadpool_mode_compare.exe <tasks> <coroutines> <yields_per_coroutine> <workers>
+```bash
+./threadpool_stress.exe 50000 8 8        # <tasks> <workers> <submitters>
+./threadpool_benchmark.exe 100000 4      # <tasks> <submitters>
+./threadpool_mode_compare.exe 20000 2000 10 4  # <tasks> <coroutines> <yields> <workers>
 ```
 
-示例：
+---
 
-```powershell
-.\threadpool_mode_compare.exe 20000 2000 10 4
-```
+## 文档
 
-输出包含：
-
-- `thread_only`：纯线程模式下提交普通任务的耗时和吞吐。
-- `thread_and_coroutine`：线程 + 协程模式下多个协程多次 `yield` 的耗时和吞吐。
-
-这个对比主要用于观察协程调度的额外成本。协程模式的价值不在于让极短任务更快，而在于让长流程任务可以主动挂起、让出 worker，并用较少线程承载更多轻量执行单元。
-
-## 适用场景
-
-适合：
-
-- 学习 C++ 线程池、条件变量、future 和 coroutine 调度。
-- 小型工具中的后台任务执行。
-- CPU 密集型批处理。
-- 需要异步返回值的简单并行任务。
-- 验证线程池调度、取消、关闭和压力测试策略。
-
-不适合：
-
-- 高实时性任务调度。
-- 复杂优先级调度。
-- 极高吞吐、低延迟服务的核心路径。
-- 需要强制终止任务的场景。
-- 完整异步 runtime 或事件循环替代品。
-
-## 当前边界
-
-项目仍保留一些明确边界：
-
-- 没有任务优先级。
-- 没有动态扩缩容。
-- 没有 work stealing。
-- 没有单个任务级超时取消。
-- 协程支持还不是完整 `Task<T>` 模型。
-- benchmark 仍是基础版本，缺少跨平台 CI、长期 soak test 和统计置信区间。
+| 文档 | 内容 |
+|------|------|
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 代码架构、组件职责、数据流、锁层次、文件组织 |
+| [DESIGN.md](docs/DESIGN.md) | 设计决策、调度策略、trade-off、取舍分析 |
+| [IMPLEMENTATION_PRINCIPLE.md](docs/IMPLEMENTATION_PRINCIPLE.md) | 逐层实现原理、源码追踪 |
+| [INTERVIEW_QUESTIONS.md](docs/INTERVIEW_QUESTIONS.md) | 项目面试问题与回答要点 |
+| [DEVELOPMENT_NOTES.md](docs/DEVELOPMENT_NOTES.md) | 29 个开发问题的原因分析和解决策略 |

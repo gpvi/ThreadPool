@@ -1,704 +1,415 @@
-# ThreadPool 详细设计说明
+# ThreadPool 设计文档
 
-本文档说明当前线程池项目的设计思想、任务调度策略、生命周期管理、协程支持、优点与缺点，以及它距离完整生产级线程池还缺少什么。
+本文档阐述线程池项目的设计思想、核心策略、关键决策的动机和取舍。架构层面（组件职责、数据流、锁层次、文件组织）见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-## 设计目标
+## 设计目标与边界
 
-这个项目的目标不是做一个功能最复杂的线程池，而是实现一个结构清晰、可测试、可扩展的小型 C++ 并发组件。
+### 目标
 
-核心目标：
+- 用固定数量 worker 线程复用系统线程资源，避免频繁创建销毁
+- 统一的任务提交流程：函数指针、lambda、成员函数、带返回值任务
+- 通过 `std::future` 把异步结果和异常传回调用方
+- 支持优雅关闭，可选的两种语义：排空（Drain）与取消（CancelPending）
+- 支持 `wait_idle` 方便测试同步和批处理阶段衔接
+- 在 C++20 环境下支持协程调度到线程池，以及协作式让出
+- 保持 C++14 基础接口可用，C++20 特性条件启用
 
-- 使用固定数量 worker 线程复用系统线程资源。
-- 支持纯线程模式和线程 + 协程模式切换。
-- 支持普通函数、lambda、成员函数和带返回值任务。
-- 使用 `std::future` 把异步任务结果返回给调用方。
-- 支持优雅关闭和取消尚未执行的排队任务。
-- 支持等待线程池空闲，方便测试和业务同步。
-- 支持 C++20 协程调度到线程池执行，并支持协程主动让出 worker。
-- 提供压力测试和基础 benchmark，观察稳定性、吞吐和调度延迟。
-- 保持 C++14 基础接口可用，同时在 C++20 下启用协程能力。
+### 非目标
 
-## 总体架构
+- 不是高性能任务调度引擎或事件循环替代品
+- 不实现抢占式调度、不强制终止线程
+- 不提供完整的 `Task<T>` 协程异步组合模型
+- 不处理网络 I/O、定时器、信号等
 
-```mermaid
-flowchart TD
-    Client["调用方"] --> Submit["ThreadPool::submit()"]
-    Client --> StopSubmit["ThreadPool::submit_with_stop()"]
-    Client --> Schedule["co_await pool.schedule()"]
+## 任务模型：从任意可调用对象到 `void()`
 
-    Submit --> Package["bind + packaged_task"]
-    StopSubmit --> Package
-    Schedule --> ResumeTask["coroutine resume task"]
+### 类型擦除链路
 
-    Package --> Future["std::future"]
-    Package --> Queue["全局普通任务队列"]
-    ResumeTask --> LocalQueue["worker 本地协程队列"]
-
-    Queue --> Cond["condition_variable"]
-    LocalQueue --> Cond
-    Cond --> WorkerA["Worker 0"]
-    Cond --> WorkerB["Worker 1"]
-    Cond --> WorkerC["Worker N"]
-
-    WorkerA --> Execute["执行任务"]
-    WorkerB --> Execute
-    WorkerC --> Execute
-
-    Execute --> Active["active_tasks 计数"]
-    Queue --> Queued["queued_tasks 观测"]
-    Active --> Idle["wait_idle / wait_idle_for"]
-```
-
-主要组件：
-
-- `threadpool::ThreadPool`：对外 facade，负责暴露任务提交、关闭、状态查询和协程 awaiter。
-- `threadpool::ThreadPoolRuntime`：运行时协调层，负责关闭状态、worker 唤醒、启动关闭流程，以及连接调度器和 worker 组。
-- `ExecutionMode`：运行模式，决定线程池是否启用协程调度能力。
-- `Options`：线程池启动参数，包含 worker 数量和运行模式。
-- `threadpool::SafeQueue<T>`：线程安全队列，保存待执行任务。
-- 全局任务队列：保存普通 `submit()` 任务。
-- worker 本地协程队列：保存对应 worker 的协程恢复任务。
-- `Worker`：内部工作线程对象，循环等待、取任务、执行任务。
-- `StopSource` / `StopToken`：协作式取消机制。
-- `ScheduleAwaiter`：把协程切换到线程池 worker。
-- `YieldAwaiter`：让当前协程主动让出 worker，并重新排队等待恢复。
-
-当前项目采用 header-only 拆分方式，外部仍只需要包含：
-
-```cpp
-#include "ThreadPool.h"
-```
-
-内部文件职责：
-
-```text
-ThreadPool.h           对外主入口、ThreadPool 声明和模板 submit
-ThreadPoolRuntime.h    运行时协调层，集中启动、关闭和 worker 唤醒
-ThreadPoolRuntimeImpl.h ThreadPoolRuntime inline 实现
-TaskScheduler.h        普通任务队列、worker 协程队列、work stealing、空闲等待
-ThreadPoolImpl.h       ThreadPool facade 的少量 inline 实现
-ThreadPoolSubmit.h     submit / submit_with_stop 模板实现
-ThreadPoolWorker.h     ThreadPoolWorker 类型、worker 循环和任务执行逻辑
-WorkerGroup.h          worker 生命周期、扩缩容、join 管理
-WorkerGroupImpl.h      WorkerGroup 创建 ThreadPoolWorker 的 inline 实现
-ThreadPoolOptions.h    关闭模式、运行模式、启动参数
-ThreadPoolStopToken.h  协作式取消 token/source
-ThreadPoolTypeTraits.h C++14/C++20 类型萃取兼容层
-SafeQueue.h            线程安全队列
-```
-
-## 任务模型
-
-线程池内部队列只保存一种任务类型：
+外部提交的任务可以是任意签名，但内部队列只存储一种类型：
 
 ```cpp
 std::function<void()>
 ```
 
-但调用方可以提交各种形式的任务：
+这是设计中的第一个关键决策——**worker 不需要知道任务的真实类型**。
 
-```cpp
-pool.submit(add, 1, 2);
-pool.submit([] { return 42; });
-pool.submit(&Calculator::multiply, &calc, 3, 4);
+转换过程分五步：
+
+```
+submit(f, args...)                                    // f: int(int, int)
+    │
+    ▼
+std::bind(f, args...)                                 // → 无参可调用对象
+    │
+    ▼
+std::packaged_task<ReturnType()>                      // → 打包返回值通道
+    │
+    ▼
+packaged_task::get_future()                           // → 返回给调用方
+    │
+    ▼
+lambda [packaged] { (*packaged)(); }                  // → std::function<void()>
+    │
+    ▼
+SafeQueue.push() → notify_one()
 ```
 
-`submit()` 会把这些不同形式统一转换成 `std::function<void()>`。
+### 为什么选 `std::function<void()>` 而不是模板化队列
 
-转换过程：
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| 类型擦除（当前） | worker 实现简单、队列类型统一 | 虚函数调用开销、无法编译期优化 |
+| 模板化队列 | 零虚函数开销 | 每种签名实例化一套队列，worker 需知道所有类型 |
+| 函数指针 + void* | 零分配 | 不安全、不支持 lambda 捕获 |
 
-1. `std::result_of` 推导任务返回类型。
-2. `std::bind` 绑定函数和参数，得到无参函数对象。
-3. `std::packaged_task<return_type()>` 包装任务。
-4. `packaged_task::get_future()` 返回结果通道。
-5. 把 `packaged_task` 包进 `std::function<void()>`。
-6. 任务入队，并唤醒一个 worker。
+对于本项目定位（学习、小型工具、后台批处理），类型擦除方案的代码简洁性收益远超其性能代价。
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant P as ThreadPool
-    participant Q as SafeQueue
-    participant W as Worker
-    participant F as future
+### 为什么用 `std::packaged_task` 而不是 `std::promise` 手写
 
-    C->>P: submit(f, args...)
-    P->>P: bind(f, args...)
-    P->>P: packaged_task
-    P-->>C: future
-    P->>Q: push(wrapper)
-    P->>W: notify_one
-    W->>Q: pop(wrapper)
-    W->>W: wrapper()
-    C->>F: get()
-```
+`packaged_task` 一次性封装了三个职责：
+1. 调用任务函数
+2. 捕获返回值到 `promise`
+3. 在异常时自动将 `std::current_exception()` 写入 promise
 
-这种设计的好处是 worker 不需要知道任务的真实类型、参数列表和返回值类型。worker 只负责执行 `void()`。
+如果手写 `promise`，需要手动 try/catch + set_value/set_exception，容易遗漏。
+
+### C++14 兼容：`std::apply` 的替代
+
+[ThreadPoolSubmit.h](../ThreadPoolSubmit.h) 中，C++17 及以上用 `std::apply` 展开 tuple 参数，C++14 回退到 `index_sequence` 手动展开。返回类型萃取同样在 [ThreadPoolTypeTraits.h](../ThreadPoolTypeTraits.h) 中做条件编译：C++17+ 用 `std::invoke_result_t`，C++14 用 `std::result_of`。
+
+`std::result_of` 在 C++20 被正式移除，MSVC 的 C++20 模式不再提供它。这是早期 CI 在 Windows 上失败的直接原因。
 
 ## 调度策略
 
-当前线程池使用的是固定线程数、普通任务全局 FIFO 队列、worker 本地协程队列、条件变量唤醒的调度策略。
+### 双层队列模型
 
-### 分层职责划分
+```
+普通任务 ──► 全局 FIFO 队列 (SafeQueue, 所有 worker 共享)
 
-当前实现按 facade、runtime、scheduler、worker group、worker 执行单元拆分：
+协程恢复 ──► Worker 0 本地协程队列
+协程恢复 ──► Worker 1 本地协程队列
+              ...
+协程恢复 ──► Worker N 本地协程队列
+```
 
-`ThreadPool` 负责：
+**为什么普通任务和协程恢复不混在同一队列？**
 
-- 提供任务提交、等待空闲、状态查询等对外接口。
-- 持有 `ThreadPoolRuntime`，不直接管理任务队列、worker 线程数组和底层锁。
-- 提供 `schedule()` / `yield()` 这类协程入口，并转发给 runtime。
+最初实现是把 `handle.resume()` 直接包装成普通任务入全局队列。这导致三个问题：
+1. 无法表达协程与 worker 的亲和性
+2. `yield()` 后不一定回到当前 worker
+3. 后续无法扩展 work stealing
 
-`ThreadPoolRuntime` 负责：
+分离后，"一个 worker 承载多个协程"的模型变得更清晰。
 
-- 管理运行时关闭状态、启动状态和 worker 唤醒条件变量。
-- 协调 `TaskScheduler`、`WorkerGroup` 和 `ThreadPoolWorker`。
-- 在提交任务、协程恢复、关闭线程池时完成跨层调度。
-- 给 worker 提供 `wait_for_work()` / `finish_work()` 这样的内部接口，避免 worker 直接访问上层私有字段。
+### Worker 取任务的优先级
 
-`TaskScheduler` 负责：
+这是一个需要仔细平衡的设计点。单纯"协程优先"会让普通任务饥饿，单纯"公平轮询"会损害协程响应性。
 
-- 保存全局普通任务队列。
-- 保存 worker 本地协程队列。
-- 选择协程初始调度目标 worker。
-- 执行 work stealing。
-- 维护 active task 计数。
-- 判断线程池是否空闲。
-- 提供 `wait_idle`、排队任务数、排队协程数等调度状态能力。
-- 管理自己的调度状态锁和 idle 条件变量。
+当前策略（[TaskScheduler.h:126-150](../TaskScheduler.h#L126-L150)）：
 
-`ThreadPoolWorker` 负责：
+```
+1. 若 coroutine_burst >= burst_limit（默认 8）
+   → 优先取全局普通任务，成功后 burst 重置为 0
+2. 取本 worker 协程队列
+   → 成功则 burst++
+3. 取全局普通任务
+   → 成功则 burst 重置为 0
+4. steal 其他 worker 的协程任务
+   → 成功则 burst 不变（不惩罚 steal）
+```
 
-- 持有所属 runtime 指针和 worker id。
-- 等待任务到达或空闲超时。
-- 优先执行本地协程恢复任务。
-- 回退执行全局普通任务。
-- 在空闲时尝试偷取其他 worker 的协程恢复任务。
-- 执行任务并更新活跃任务计数。
+**burst_limit 的设计考虑：**
+- 太大会让普通任务长时间得不到执行
+- 太小会限制协程吞吐
+- 默认值 8 是一个经验值，可由 `ThreadPoolOptions::coroutine_burst_limit` 调整
 
-这样拆分后，pool 更像调度器和资源管理者，worker 更像执行单元。
+### Round-Robin 初始分配
 
-`WorkerGroup` 负责：
+`schedule()` 对协程做首次调度时，使用轮询策略选择目标 worker（[TaskScheduler.h:250-252](../TaskScheduler.h#L250-L252)）。`next_coroutine_worker_` 在 mutex 保护下递增，保证多个调用方并发 `schedule` 时分配均匀。
 
-- 保存 worker 线程列表。
-- 维护 live worker 数量。
-- 分配 worker id。
-- 根据队列压力动态创建 worker。
-- 处理空闲 worker 是否可以退出。
-- 记录已空闲退出的 worker，并在后续扩容前回收对应 thread 对象。
-- 在线程池关闭时 join 所有 worker。
-- 管理自己的线程容器锁，外部不直接操作线程数组。
+### Work Stealing
 
-拆分后，`ThreadPool` 更像 facade，`ThreadPoolRuntime` 负责“运行时怎么协调”，`TaskScheduler` 负责“任务怎么排”，`WorkerGroup` 负责“线程怎么管”，`ThreadPoolWorker` 负责“线程怎么跑”。
+当 worker 自己的协程队列为空、全局队列也为空时，会尝试从其他 worker 偷取协程恢复任务（[TaskScheduler.h:109-124](../TaskScheduler.h#L109-L124)）。
 
-### 锁管理策略
+**为什么只 steal 协程任务，不 steal 普通任务？**
 
-项目采用“谁拥有数据，谁管理锁”的策略：
+普通任务只有一个全局队列，所有 worker 都从同一个地方取，不需要 steal。只有协程任务分布在各 worker 的本地队列中，才存在负载不均的问题。
 
-- `SafeQueue` 内部保护自己的队列 push / pop / size / clear。
-- `TaskScheduler` 保护 active task 计数、协程轮询下标和 idle 等待条件。
-- `WorkerGroup` 保护 worker 线程数组和已退休 worker 记录。
-- `ThreadPoolRuntime` 只保护启动/关闭状态和 worker 唤醒条件。
-- `ThreadPoolWorker` 不直接访问任何上层锁，只通过 runtime 方法取任务、完成任务和退出。
+**Steal 策略：**
+- 以 `(worker_id + offset) % N` 的顺序轮询目标 worker
+- 找到第一个有任务的目标即拿走（不是偷一半）
+- 偷取发生在 worker 即将空闲之时，不引入额外开销
 
-这种拆分避免了一个大锁覆盖所有逻辑，也避免底层组件依赖上层对象的私有状态。代价是跨层状态变化需要更明确的通知，例如任务入队后由 runtime 负责唤醒 worker，任务完成后由 scheduler 判断是否进入 idle。
+### 协程亲和性
 
-### 运行模式
+`yield()` 的语义是"我先让出，但最好还是回到当前 worker"（`prefer_current_worker=true`）。实现上：
+- 通过 `thread_local` 检查调用者是否确实是本 pool 的 worker
+- 如果是，放入该 worker 的本地协程队列
+- 如果不是（或未运行在 worker 上），回退到 round-robin
 
-线程池支持两种运行模式：
+亲和性的好处是减少线程间数据迁移，提高缓存局部性。
+
+## 生命周期设计
+
+### 状态机
+
+```
+                    ┌─────────┐
+                    │ 构造     │
+                    └────┬────┘
+                         │ start() 创建 worker
+                    ┌────▼────┐
+              ┌─────│ Running │◄──────────────┐
+              │     └────┬────┘               │
+              │          │ 队列清空            │
+              │     ┌────▼────┐               │
+              │     │  Idle   │───────────────┘
+              │     └────┬────┘  新任务到来
+              │          │
+              │     ┌────▼──────────┐
+              │     │ ShuttingDown  │  shutdown() 触发
+              │     └────┬──────────┘
+              │          │
+         ┌────┴────┐ ┌──┴────────────┐
+         │  Drain  │ │ CancelPending │
+         └────┬────┘ └──┬────────────┘
+              │          │
+         ┌────▼──────────▼────┐
+         │     Stopped         │  所有 worker join
+         └─────────────────────┘
+```
+
+### 自动启动与自动关闭
+
+这两个决策来自实际使用中的教训：
+
+**自动启动**：早期版本需手动调用 `init()`。用户创建 pool 后直接 submit，任务入队但没有 worker 执行，`future.get()` 永久阻塞。改为构造函数自动启动后，`init()` 保留为幂等接口。
+
+**自动关闭**：如果析构时还有 joinable 线程未 join，`std::thread` 析构函数会调用 `std::terminate` 终止程序。析构函数中调用 `shutdown()` 并用 try/catch 保护，保证资源回收。析构函数标记为 `noexcept`。
+
+### 两种关闭语义
+
+| | Drain（默认）| CancelPending |
+|---|---|---|
+| 新任务提交 | 抛异常 | 抛异常 |
+| 已入队普通任务 | 继续执行 | 清空丢弃 |
+| 已开始执行的任务 | 执行完毕 | 执行完毕 |
+| 协程队列中的任务 | 继续执行 | **不清空**（见下文）|
+| 被丢弃任务的 future | N/A | `std::future_error` |
+| 适用场景 | 不丢任务的正常退出 | 快速退出、用户取消、服务降级 |
+
+**为什么 CancelPending 不清空协程队列？**
+
+协程挂起后，恢复它的唯一途径就是队列中的 `resume()` 任务。直接丢弃会让协程永远无法恢复，promise 不会完成，等待方（`CoroutineTask::get()`）永久阻塞。正确做法是让协程恢复一次，后续它如果尝试再 `schedule()` 会因为线程池已关闭而收到异常。
+
+### 空闲等待
+
+空闲条件定义为：
+
+```
+queued_tasks == 0 && queued_coroutines == 0 && active_tasks == 0
+```
+
+注意 `active_tasks` 是指 worker 已经取出队列、正在执行但尚未完成的任务。如果只判断队列为空，可能漏掉正在执行中的任务（它们在队列里看不到，但实际上还在占用 worker）。
+
+三个接口：
+- `wait_idle()` — 无限等待
+- `wait_idle_for(timeout)` — 有超时
+- `wait_idle_until(deadline)` — 有截止时间
+
+这些接口在 `TaskScheduler` 层实现，有自己的 `idle_cv_` 和 `mutex_`，与 worker 唤醒的 `work_cv_` 独立。两个条件变量的等待条件不同：worker 等待的是"有活干或要关闭"，idle 等待的是"所有活干完"。强行共用一把锁会导致语义混淆。
+
+### 动态扩缩容
+
+当前支持基础的动态调整：
+
+- **扩容触发**：`submit_task()` 中检查 `queued_tasks > live_workers` 且 `live_workers < max_workers`，自动创建新 worker
+- **缩容触发**：worker 空闲超时（默认 30s）后，若 `live_workers > min_workers`，该 worker 主动退出
+- **线程回收**：退出的 worker 记录自己的 `thread::id`，下一次 `spawn()` 时由 `reap_retired_workers()` 执行 join 和 erase
+
+**为什么不是退出的 worker 自己 join 自己？**
+
+线程不能 join 自己——尝试这样做会死锁。必须由其他线程来 join 退出线程。`WorkerGroup` 的设计是：每次创建新线程前先"收割"已退休的线程对象，在 `shutdown()` 时通过 `join_all()` 做最终清理。
+
+**异常安全**：`WorkerGroup::spawn()` 先创建 `std::thread` 并放入容器，成功后才递增 live worker 计数。如果线程创建失败，计数与实际状态一致。
+
+## 协程调度设计
+
+### C++20 协程的缺口
+
+C++20 标准库提供了协程的语言机制（`co_await`、`co_return`、`promise_type`），但故意不提供调度器。协程在哪里恢复执行，完全由 awaiter 的 `await_suspend` 实现决定。
+
+本项目的 `ScheduleAwaiter` 在 `await_suspend` 中拿到 `std::coroutine_handle<>`，把它包装成线程池任务并放入队列。这样协程就被"调度到了线程池线程"。
+
+### schedule() vs yield()
+
+| | schedule() | yield() |
+|---|---|---|
+| 语义 | "把我调度到线程池 worker 上" | "我先让出，让别人跑" |
+| 初始位置 | 任意线程 | 已经在 worker 上 |
+| 亲和性 | round-robin 分配 | 优先回当前 worker |
+| await_ready | 永远 false | 永远 false |
+| 典型用法 | 协程入口第一行 | 循环体中周期性让出 |
+
+两个 awaiter 的 `await_ready()` 都返回 `false`，这意味着协程总会挂起并重新排队。这是刻意设计——即使当前线程恰好是 pool 的 worker，也要走一遍入队-取出的流程，保证公平性。
+
+### 协程模式显式启用
+
+不是所有线程池使用者都需要协程。如果默认开启协程队列，会为每个 worker 创建空的协程队列，浪费内存。更重要的是，`ThreadOnly` 模式下调用 `schedule()` 直接抛异常，能在开发阶段暴露配置错误，而不是让协程默默在错误的线程上执行。
+
+## 协作式取消
+
+### 为什么不用强制终止
+
+C++ 不能安全地强制终止线程。暴力杀线程的后果：
+- 持有的互斥锁不会释放
+- 栈上对象的析构函数不会执行
+- 共享状态可能写了一半
+- 文件、socket 等资源泄漏
+
+因此采用协作式取消：
 
 ```cpp
-enum class ExecutionMode {
-	ThreadOnly,
-	ThreadAndCoroutine
-};
+StopSource source;
+auto future = pool.submit_with_stop(source.token(), [](StopToken token) {
+    while (!token.stop_requested()) {
+        do_work_chunk();       // 小粒度工作单元
+    }
+    // 安全点：锁已释放，资源已释放
+});
+source.request_stop();          // 通知所有持有此 token 的任务
 ```
 
-默认模式是 `ThreadOnly`，只启用普通任务提交和 worker 调度。该模式适合大多数同步函数、lambda、成员函数等普通任务。
+### StopSource / StopToken 的实现
 
-如果需要使用 C++20 协程调度，需要显式启用 `ThreadAndCoroutine`：
+[ThreadPoolStopToken.h](../ThreadPoolStopToken.h) 的设计是一个经典的发布-订阅模式：
+
+- `StopSource` 和从它创建的 `StopToken` 共享一个 `shared_ptr<atomic<bool>>`
+- `request_stop()` 写入 `true`（memory_order_release）
+- `stop_requested()` 读取（memory_order_acquire）
+- acquire-release 配对保证：写入 stop 之前的所有修改，在读取到 stop 之后对这些线程可见
+- `shared_ptr` 保证 token 不会悬空——即使 source 先析构
+
+## 线程安全模型
+
+### 锁策略核心原则
+
+**"谁拥有数据，谁管理锁。"**
+
+这个原则防止了常见的"大锁症"——用一把锁覆盖所有操作。大锁的缺点是锁竞争集中，且无法并行执行不相关的操作。
+
+### 各层持有的共享状态和锁
+
+| 层次 | 共享状态 | 锁 | 备注 |
+|------|---------|-----|------|
+| SafeQueue | `queue<T>` | `m_mutex` | 完全内部化 |
+| TaskScheduler | `active_tasks_`, `next_coroutine_worker_` | `mutex_` | 不保护队列 |
+| TaskScheduler | idle 等待 | `idle_cv_` | 独立的 cv |
+| WorkerGroup | `workers_`, `retired_worker_ids_` | `mutex_` | 仅线程容器 |
+| WorkerGroup | `live_workers_`, `next_worker_id_` | 无（atomic） | 无锁读写 |
+| ThreadPoolRuntime | `shutdown_`, `started_` | `mutex_` | 也用于 work_cv_ |
+
+### 关键并发时序
+
+**提交任务时的状态检查：**
 
 ```cpp
-threadpool::ThreadPool pool(
-	4,
-	threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine
-);
+// ThreadPoolRuntimeImpl.h:79-93
+void submit_task(Task task) {
+    {
+        lock(mutex_);
+        if (shutdown_) throw ...;           // 1. 持锁检查
+        scheduler_.push_task(move(task));   // 2. 入队（SafeQueue 内部加锁）
+        maybe_grow_unlocked();              // 3. 扩容（WorkerGroup 内部加锁）
+    }  // 4. 释放 runtime 锁
+    work_cv_.notify_one();                  // 5. 锁外通知
+}
 ```
 
-也可以使用启动参数对象：
+注意 notify 在锁外执行——如果 notify 在锁内，被唤醒的 worker 会立即尝试获取同一把锁而阻塞，白费一次唤醒。
+
+**Worker 等待任务时的条件判断：**
 
 ```cpp
-threadpool::ThreadPool::Options options;
-options.min_workers = 4;
-options.max_workers = 4;
-options.execution_mode = threadpool::ThreadPool::ExecutionMode::ThreadAndCoroutine;
-
-threadpool::ThreadPool pool(options);
+// ThreadPoolRuntimeImpl.h:103-108
+work_cv_.wait_for(lock, idle_timeout, [this, worker_id] {
+    return shutdown_ || scheduler_.has_any_work_for_worker(worker_id);
+});
 ```
 
-这样做的原因是让普通线程池场景保持简单，协程能力作为显式增强项启用，避免调用方误以为所有线程池实例都可以进行协程调度。
+predicate 不是简单的 `!queue.empty()`，而是 `has_any_work_for_worker()`，后者的判断范围包括：全局普通队列、自己的协程队列、其他 worker 的协程队列（可 steal 的）。这保证 worker 在有 stealable 任务时也能被唤醒。
 
-### 固定线程数
+### `thread_local` 的使用
 
-线程池构造时创建固定数量 worker：
+两个 `thread_local` 变量提供 worker 上下文：
 
 ```cpp
-threadpool::ThreadPool pool(4);
+static thread_local ThreadPoolRuntime *current_runtime;
+static thread_local std::size_t current_worker_id;
 ```
 
-worker 数量不能为 0，否则构造函数抛出 `std::invalid_argument`。
+用于：
+1. `enqueue_coroutine_resume()` 中判断 `prefer_current_worker` 时的运行时和 worker_id
+2. 让协程 yield 时知道"我是哪个 runtime 的哪个 worker"
 
-固定线程数的特点：
+`thread_local` 保证了这些状态天然线程安全，不需要加锁。
 
-- 实现简单。
-- 线程数量稳定，不会在高峰期无限增长。
-- 适合 CPU 密集型任务或可控后台任务。
-- 不支持根据负载动态扩缩容。
+## 可观测性设计
 
-### 共享 FIFO 队列
+线程池提供三个维度的状态观测：
 
-普通任务进入全局 `SafeQueue<std::function<void()>>`。
+| 指标 | 含义 | 实现 |
+|------|------|------|
+| `queued_tasks()` | 全局队列中等待执行的任务 | `SafeQueue::size()` |
+| `queued_coroutines()` | 所有协程队列中等待恢复的协程 | 遍历 sum |
+| `active_tasks()` | worker 已取出、正在执行的任务 | `TaskScheduler::active_tasks_` |
 
-worker 被唤醒后从队列头部取任务执行，因此整体上接近 FIFO。
+这三个计数是 `wait_idle` 正确性的基础。`active_tasks` 的维护规则：
+- `mark_started()`：pop 成功后调用（在 runtime 锁内）
+- `mark_finished()`：任务执行完成后调用（在 runtime 锁内）
+- 协程恢复任务也记入 active，保持一致性
 
-注意：由于多线程并发执行，任务“开始执行”的顺序接近提交顺序，但任务“完成”的顺序不保证一致。耗时短的任务可能比先提交的长任务更早完成。
+## 取舍与限制
 
-### worker 本地协程队列
+### 有意为之的限制
 
-在线程 + 协程模式下，每个 worker 维护一个本地协程队列：
+| 限制 | 原因 |
+|------|------|
+| 无任务优先级 | 保持队列模型简单。优先级可通过多 pool 间接实现 |
+| 全局 FIFO 而非 per-worker 队列 | 实现简单，适合当前规模。多 worker 竞争同一队列在高并发下是瓶颈 |
+| 无抢占式调度 | C++ 无安全强制终止线程的机制。协作式是唯一安全选项 |
+| 协程仅 schedule/yield | 完整 `Task<T>` 需要独立的异步组合框架，超出本项目的范围 |
+| `CancelPending` 破坏 future | 设计上的取舍——清空队列必然破坏 promise。调用方须处理 `future_error` |
 
-```text
-Worker 0 coroutine queue
-Worker 1 coroutine queue
-Worker N coroutine queue
-```
+### 性能边界
 
-普通任务仍然进入全局队列，协程恢复任务进入 worker 本地队列。
+- 全局队列在 worker 数较多（>16）且任务极短时，锁竞争成为瓶颈
+- 极短任务（<1μs）场景下，调度开销可能超过任务本身。这不是线程池最适合的场景
+- benchmark 输出受硬件、系统负载、编译器优化影响，不应作为 CI 通过条件
 
-调度策略：
+## 测试与验证
 
-- `schedule()`：按轮询策略选择一个 worker，并把协程恢复动作放入该 worker 的本地协程队列。
-- `yield()`：如果当前协程已经运行在线程池 worker 上，则优先放回当前 worker 的本地协程队列。
-- worker 执行任务时，优先检查自己的协程队列，再检查全局普通任务队列。
-- worker 连续执行一定数量的协程恢复任务后，会优先检查一次全局普通任务队列，避免普通任务饥饿。
-- worker 本地协程队列为空且全局普通任务队列也为空时，会尝试从其他 worker 的协程队列偷取恢复任务。
+### 测试分层
 
-这个设计让“每个 worker 承载多个协程”的模型更清晰，也为后续实现 worker 本地调度、亲和性和 work stealing 留出空间。
+| 测试 | 文件 | 目的 | CTest |
+|------|------|------|-------|
+| 行为测试 | `test.cpp` | 验证所有功能接口的正确性 | 是 |
+| 协程测试 | `test_coroutine.cpp` | 验证 schedule/yield、关闭行为 | 是 |
+| 压力测试 | `stress_test.cpp` | 并发提交 + CancelPending + StopToken | 是（5000/4/4） |
+| 基准测试 | `benchmark.cpp` | 观察吞吐和延迟趋势 | 否（结果不稳定） |
+| 模式对比 | `mode_compare.cpp` | 对比 ThreadOnly vs ThreadAndCoroutine | 否 |
 
-### 条件变量唤醒
+### CI 覆盖
 
-当队列为空时，worker 使用 `condition_variable::wait(lock, predicate)` 休眠。
-
-predicate 是：
-
-```cpp
-m_shutdown || !m_queue.empty()
-```
-
-这样可以处理两类事件：
-
-- 有新任务入队。
-- 线程池进入关闭流程。
-
-使用 predicate 的原因：
-
-- 避免虚假唤醒导致 worker 空转。
-- 避免通知丢失后 worker 永久睡眠。
-- 让关闭状态和任务状态在同一套等待条件中统一处理。
-
-### 唤醒策略
-
-提交一个任务后调用：
-
-```cpp
-m_conditional_lock.notify_one();
-```
-
-这表示每次新任务只唤醒一个 worker。这样可以减少无意义唤醒，适合常规任务提交。
-
-关闭线程池时调用：
-
-```cpp
-m_conditional_lock.notify_all();
-```
-
-因为所有 worker 都需要醒来检查关闭状态并退出。
-
-## 生命周期策略
-
-线程池生命周期分为四个阶段：
-
-```mermaid
-stateDiagram-v2
-    [*] --> Constructing
-    Constructing --> Running: 创建 worker
-    Running --> Idle: 队列为空
-    Idle --> Running: 新任务提交
-    Running --> ShuttingDown: shutdown()
-    Idle --> ShuttingDown: shutdown()
-    ShuttingDown --> Draining: Drain 模式
-    ShuttingDown --> Canceling: CancelPending 模式
-    Draining --> Stopped: 队列清空且 worker 退出
-    Canceling --> Stopped: 排队任务丢弃且 worker 退出
-    Stopped --> [*]
-```
-
-### 自动启动
-
-构造函数会自动调用 `init()`：
-
-```cpp
-threadpool::ThreadPool pool(4);
-```
-
-调用方不需要手动启动线程。`init()` 仍保留，并且是幂等的，多次调用不会重复创建 worker。
-
-### 自动关闭
-
-析构函数会调用 `shutdown()`：
-
-```cpp
-~ThreadPool() noexcept;
-```
-
-这样可以避免调用方忘记关闭线程池时触发 `std::terminate`。
-
-### 关闭模式
-
-当前支持两种关闭模式。
-
-#### Drain
-
-默认模式：
-
-```cpp
-pool.shutdown();
-```
-
-语义：
-
-- 停止接收新任务。
-- 已经提交的任务继续执行。
-- 队列排空后 worker 退出。
-- 调用方等待所有 worker join。
-
-适合希望不丢任务的场景。
-
-#### CancelPending
-
-立即取消排队任务：
-
-```cpp
-pool.shutdown(threadpool::ThreadPool::ShutdownMode::CancelPending);
-```
-
-语义：
-
-- 停止接收新任务。
-- 清空还没开始执行的普通排队任务。
-- 已经开始执行的任务继续运行到结束。
-- 被清空任务对应的 `future.get()` 会抛 `std::future_error`。
-- 已经挂起并进入 worker 协程队列的协程恢复任务不会被直接清空，避免协程永远无法恢复并导致等待方挂起。
-
-适合程序退出、用户取消批量作业、服务降级等场景。
-
-## 等待空闲策略
-
-线程池维护两个状态：
-
-- `queued_tasks()`：队列中尚未开始执行的任务数。
-- `active_tasks()`：worker 已经取出、正在执行的任务数。
-
-当满足下面条件时，线程池视为空闲：
-
-```text
-queued_tasks == 0 && active_tasks == 0
-```
-
-可以使用：
-
-```cpp
-pool.wait_idle();
-pool.wait_idle_for(std::chrono::seconds(1));
-pool.wait_idle_until(deadline);
-```
-
-这些接口适合：
-
-- 单元测试等待后台任务完成。
-- 应用退出前等待后台任务收尾。
-- 批处理阶段之间做同步。
-
-## 协作式取消策略
-
-C++ 不能安全地强制终止任意正在运行的线程。强杀线程可能导致锁没有释放、对象析构不完整、共享状态损坏。
-
-因此项目采用协作式取消：
-
-```cpp
-threadpool::ThreadPool::StopSource stop_source;
-
-auto future = pool.submit_with_stop(
-	stop_source.token(),
-	[](threadpool::ThreadPool::StopToken token) {
-		while (!token.stop_requested()) {
-			do_work_chunk();
-		}
-	}
-);
-
-stop_source.request_stop();
-```
-
-特点：
-
-- `StopSource` 发出取消请求。
-- `StopToken` 被传入任务。
-- 任务自己定期检查 `stop_requested()`。
-- 任务决定何时安全退出。
-
-这是一种更安全、也更符合 C++ 资源管理模型的取消方式。
-
-## 协程调度策略
-
-C++20 协程本身只提供挂起和恢复机制，不提供线程池或事件循环。
-
-本项目提供：
-
-```cpp
-co_await pool.schedule();
-```
-
-其含义是：
-
-1. 当前协程挂起。
-2. `ScheduleAwaiter::await_suspend()` 得到 `std::coroutine_handle<>`。
-3. 按轮询策略选择一个 worker。
-4. 把 `handle.resume()` 封装成恢复任务，放入目标 worker 的本地协程队列。
-5. worker 执行该恢复任务。
-6. 协程从 `co_await` 后的位置继续运行。
-
-```mermaid
-sequenceDiagram
-    participant Co as Coroutine
-    participant Aw as ScheduleAwaiter
-    participant P as ThreadPool
-    participant W as Worker
-
-    Co->>Aw: co_await pool.schedule()
-    Aw->>P: enqueue handle.resume to worker coroutine queue
-    Co-->>Aw: suspend
-    W->>P: pop resume task
-    W->>Co: handle.resume()
-```
-
-这个设计不是重新实现协程，而是利用标准协程机制，补上“在哪里恢复执行”的调度策略。
-
-在协程已经运行到线程池 worker 后，还可以使用：
-
-```cpp
-co_await pool.yield();
-```
-
-`yield()` 会把当前协程挂起，并把 `resume()` 重新放回当前 worker 的本地协程队列。这样同一个 worker 线程可以在多个协程之间协作式轮转：
-
-```text
-Worker 0
-  -> resume coroutine A
-  -> A yield，重新入队
-  -> resume coroutine B
-  -> B yield，重新入队
-  -> resume coroutine A
-```
-
-这种模型仍然是协作式调度，不是抢占式调度。如果某个协程长时间不 `yield`，它仍然会占用当前 worker。
-
-当前协程支持仍然是轻量级的，只提供调度恢复和协作式让出，不提供完整 `Task<T>` 异步组合模型。
-
-如果线程池处于 `ThreadOnly` 模式，调用 `schedule()` 或 `yield()` 会抛出 `std::runtime_error`。这能尽早暴露模式配置错误。
-
-## 线程安全设计
-
-项目中的关键共享状态包括：
-
-- 任务队列。
-- shutdown 状态。
-- started 状态。
-- active task 计数。
-- worker 线程数组。
-
-保护策略：
-
-- `SafeQueue` 内部使用自己的 mutex 保护队列。
-- `ThreadPool` 使用 `m_conditional_mutex` 保护关闭状态、启动状态和 active task 计数。
-- 每个 worker 的协程队列独立加锁，普通任务队列和协程队列分离。
-- worker 等待使用 `condition_variable` predicate。
-- 任务提交时在锁内检查 `m_shutdown`，避免关闭后继续入队。
-
-需要注意的是，当前实现中队列有自己的锁，线程池也有自己的条件变量锁。这让队列可以独立复用，但也比“队列和条件变量共用一把锁”的实现稍复杂。
-
-## 优点
-
-### 1. 接口简单
-
-最常用接口只有：
-
-```cpp
-auto future = pool.submit(task, args...);
-```
-
-调用方容易理解。
-
-### 2. 支持返回值和异常传播
-
-通过 `std::packaged_task` 和 `std::future`，任务返回值和异常都能传回调用方。
-
-### 3. 生命周期更安全
-
-构造后自动启动，析构时自动关闭，减少误用成本。
-
-### 4. 支持两种关闭语义
-
-`Drain` 适合不丢任务，`CancelPending` 适合快速退出。
-
-### 5. 支持可观测状态
-
-`queued_tasks()`、`active_tasks()`、`wait_idle()` 让测试和业务同步更容易。
-
-### 6. 支持 C++20 协程调度
-
-可以把协程恢复到线程池 worker 上，方便编写异步流程。
-
-### 7. 有基础测试和压力测试
-
-项目包含：
-
-- 行为测试。
-- 协程测试。
-- 压力测试。
-- 基准测试。
-
-比单纯 demo 更接近可维护组件。
-
-## 缺点与限制
-
-### 1. 没有任务优先级
-
-所有任务都进入同一个 FIFO 队列。紧急任务不能插队。
-
-适合普通后台任务，不适合实时性要求高的调度系统。
-
-### 2. 没有动态扩缩容
-
-worker 数量构造后固定。
-
-如果负载变化很大，固定线程数可能不够灵活。
-
-### 3. 没有 work stealing
-
-所有 worker 共享一个队列。高并发下队列锁可能成为瓶颈。
-
-更复杂的线程池可能会使用每线程本地队列和 work stealing 策略。
-
-### 4. 取消是协作式的
-
-`StopToken` 只能通知任务退出，不能强制停止任务。
-
-如果任务不检查 token，就不会响应取消。
-
-### 5. `CancelPending` 会让 future 变成 broken promise
-
-排队任务被清空后，其 `packaged_task` 不会执行，对应 `future.get()` 会抛 `std::future_error`。
-
-这是合理行为，但调用方必须知道并处理。
-
-### 6. 协程支持还很轻量
-
-当前只有 `schedule()` 和 `yield()`，没有：
-
-- `Task<T>`
-- 协程返回值组合
-- continuation
-- cancellation-aware awaiter
-- structured concurrency
-
-### 7. benchmark 仍然比较基础
-
-目前提供了一个基础 benchmark，用于观察不同 worker 数下的任务吞吐和简单延迟采样。但它还不是严格性能评测体系，例如尚未覆盖：
-
-- 和 `std::async` 或其他线程池对比。
-- 长时间 soak test。
-- CPU 亲和性、系统负载隔离和统计置信区间。
-- 不同任务粒度、不同队列策略下的系统化对比。
-
-运行方式：
-
-```powershell
-.\threadpool_benchmark.exe <tasks> <submitters>
-```
-
-输出指标：
-
-- `tasks/sec`：单位时间完成的任务数。
-- `p50_us` / `p95_us` / `p99_us`：任务从提交到开始执行的延迟采样。
-
-benchmark 没有加入默认 CTest。功能正确性由单元测试、协程测试和压力测试覆盖；benchmark 主要用于人工观察不同配置下的性能趋势。
-
-## 纯线程模式与线程 + 协程模式对比
-
-项目提供 `mode_compare.cpp`，用于对比两种模式：
-
-- `ThreadOnly`：提交普通任务，由 worker 直接取出并执行。
-- `ThreadAndCoroutine`：启动多个协程，协程切换到 worker 后多次 `yield`，观察协作式轮转成本。
-
-运行方式：
-
-```powershell
-.\threadpool_mode_compare.exe <tasks> <coroutines> <yields_per_coroutine> <workers>
-```
-
-示例：
-
-```powershell
-.\threadpool_mode_compare.exe 20000 2000 10 4
-```
-
-对比指标：
-
-- `operations`：完成的普通任务数，或协程中的 yield 步骤加最终完成步骤。
-- `ms`：总耗时。
-- `ops/sec`：每秒完成操作数。
-
-需要注意的是，两种模式衡量的不是完全相同的工作负载。纯线程模式偏向“任务吞吐”；线程 + 协程模式偏向“协程挂起、重新排队、恢复执行”的调度开销观察。协程模式的优势通常体现在复杂异步流程、等待型任务和大量轻量执行单元，而不是极短 CPU 空任务。
-
-## 适合场景
-
-适合：
-
-- 学习 C++ 并发和线程池原理。
-- 小型工具的后台任务执行。
-- CPU 密集型批处理。
-- 测试环境中的异步任务调度。
-- 需要 `future` 返回值的简单并行任务。
-- 演示 C++20 协程如何切换到线程池执行。
-
-不适合：
-
-- 高实时性任务调度。
-- 复杂优先级调度。
-- 极高吞吐的低延迟服务核心路径。
-- 需要强制取消任务的场景。
-- 完整异步 runtime 或事件循环替代品。
+GitHub Actions 覆盖 `ubuntu-latest` + `windows-latest`，确保：
+- GCC 和 MSVC 均能编译
+- C++14 和 C++20 路径均有效
+- 平台相关差异（`microseconds::rep` 类型等）被早发现
 
 ## 后续演进方向
 
-如果继续向生产级推进，可以考虑：
-
-1. 增加优先级任务队列。
-2. 引入每 worker 本地队列和 work stealing。
-3. 增加任务超时包装器。
-4. 增加动态扩缩容。
-5. 设计完整 `Task<T>` 协程返回模型。
-6. 增加 benchmark 和长时间稳定性测试。
-7. 增加 CI，覆盖 Windows、Linux、不同编译器。
-8. 增加安装导出规则，让项目可以被 `find_package` 使用。
+1. **per-worker 普通任务队列 + work stealing**：降低全局队列锁竞争，提升多 worker 吞吐
+2. **任务优先级**：多优先级队列，紧急任务插队
+3. **完整 `Task<T>` 协程模型**：支持 co_return 值、continuation、exception propagation
+4. **更丰富的可观测性**：任务等待时间分布、per-worker 统计、prometheus 风格 metrics
+5. **CMake 安装导出**：`find_package(ThreadPool)` 支持
