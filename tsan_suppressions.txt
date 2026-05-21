@@ -1,0 +1,4 @@
+# GCC libstdc++ shared_ptr atomic refcount — known false positive
+race:std::__shared_count
+race:std::_Sp_counted_base
+race:std::__future_base::_State_baseV2

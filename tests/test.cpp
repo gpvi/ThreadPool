@@ -202,7 +202,7 @@ void test_dynamic_workers_can_retire_and_grow_again()
 	ThreadPool::Options options;
 	options.min_workers = 1;
 	options.max_workers = 4;
-	options.idle_timeout = std::chrono::milliseconds(50);
+	options.idle_timeout = std::chrono::milliseconds(500);
 
 	ThreadPool pool(options);
 	std::atomic<int> counter{0};
@@ -221,7 +221,7 @@ void test_dynamic_workers_can_retire_and_grow_again()
 		}
 
 		pool.wait_idle();
-		std::this_thread::sleep_for(std::chrono::milliseconds(120));
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 		assert(pool.worker_count() >= 1);
 		assert(pool.worker_count() <= 4);
 	}

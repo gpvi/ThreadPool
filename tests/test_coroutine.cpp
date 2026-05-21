@@ -197,11 +197,10 @@ int main()
 		options.max_workers = 1;
 		options.execution_mode = ThreadPool::ExecutionMode::ThreadAndCoroutine;
 		options.max_coroutine_queue_size = 1;
-		ThreadPool pool(options);
 
-		// Block the worker so the queue backs up
 		std::promise<void> blocker;
 		auto block_future = blocker.get_future();
+		ThreadPool pool(options);
 		pool.submit([&] {
 			block_future.get();
 		});
